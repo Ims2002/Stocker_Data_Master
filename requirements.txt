@@ -1,0 +1,13 @@
+# Stocker — dependencias mínimas del MVP
+# (descarga, almacenamiento y modelo; ver CONTEXTO.md para el diseño completo)
+
+yfinance
+pandas
+sqlalchemy
+scikit-learn
+pandas_market_calendars
+
+# Opcional — solo si se activa el fallback de descarga en
+# src/fallback/yahooquery_download.py (yfinance sigue siendo la fuente
+# principal, ver CONTEXTO.md). No se instala por defecto:
+# yahooquery

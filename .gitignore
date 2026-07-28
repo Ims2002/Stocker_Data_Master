@@ -1,0 +1,52 @@
+# --- Datos ---
+# El repo lleva el código que genera los datos, no los datos en sí.
+# raw/processed/gold se regeneran desde la fuente (yfinance); solo se
+# versiona la estructura de carpetas via .gitkeep.
+data/raw/*
+!data/raw/.gitkeep
+data/processed/*
+!data/processed/.gitkeep
+data/gold/*
+!data/gold/.gitkeep
+
+# Cualquier CSV descargado o base de datos SQLite, esté donde esté
+*.csv
+*.db
+*.sqlite
+*.sqlite3
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+
+# --- Notebooks ---
+.ipynb_checkpoints/
+
+# --- Entornos virtuales ---
+venv/
+.venv/
+env/
+ENV/
+
+# --- Variables de entorno / secretos ---
+.env
+.env.*
+
+# --- Editor / SO ---
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# --- Buzón de entrada original (ya organizado en CONTEXTO.md / docs/entregas/) ---
+# Se mantiene local para referencia propia, no se publica: es contenido
+# duplicado, no aporta nada que no esté ya en su sitio en el repo.
+/context/

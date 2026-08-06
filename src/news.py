@@ -1,0 +1,443 @@
+"""
+src/news.py — noticias y sentimiento vía Alpha Vantage NEWS_SENTIMENT.
+
+Fuente NUEVA respecto al resto del pipeline (yfinance solo cubre precios).
+Decisión explícita del usuario (2026-07-30) tras comparar tres opciones —
+ver CONTEXTO.md, sección "Noticias y sentimiento": Alpha Vantage
+NEWS_SENTIMENT (elegida — sentimiento ya calculado por su NLP, admite
+agrupar varios tickers por llamada), Finnhub company-news (límite más
+generoso pero sentimiento de pago) y yfinance.news (sin dependencia nueva
+pero sin histórico ni score).
+
+Limitación real y aceptada: el free tier de Alpha Vantage son
+NEWS_DAILY_CALL_BUDGET peticiones/día EN TOTAL. Con 208 tickers agrupados
+de NEWS_TICKERS_PER_CALL en NEWS_TICKERS_PER_CALL, completar el backfill de
+NEWS_BACKFILL_MONTHS meses lleva varias ejecuciones en varios días — el
+progreso se persiste en `news_backfill_progress` (tabla) para poder parar y
+retomar sin repetir trabajo ya hecho ni desperdiciar presupuesto de
+peticiones.
+
+Capas, igual que el resto del pipeline (raw → processed):
+- raw: volcado JSON tal cual de cada llamada, en data/raw/news/ (auditoría,
+  igual que download.py con los CSV de precios).
+- processed: tabla `news_articles`, upsert por (ticker, url) — dedupe
+  natural si dos ventanas de fechas se solapan.
+- agregado: VISTA `news_sentiment_daily` (db.py) — nunca tabla física, para
+  que no pueda quedar desincronizada de news_articles.
+
+Este módulo NO integra la señal como feature del modelo — eso es un paso
+posterior y deliberadamente separado (ver CONTEXTO.md): aquí solo se puebla
+la base de datos.
+
+Uso:
+    python news.py                    # modo automático: backfill si queda pendiente, si no, diario
+                                       # (este es el que debe usar la tarea programada)
+    python news.py --backfill         # fuerza el backfill aunque ya estuviera completo
+    python news.py --daily            # fuerza la actualización incremental (ayer→hoy)
+    python news.py --max-calls 10     # presupuesto de llamadas distinto al de config.py
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import hashlib
+import json
+import sys
+import time
+from pathlib import Path
+
+import requests
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy.engine import Engine
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import db as dbmod  # noqa: E402
+from config import (  # noqa: E402
+    ALPHA_VANTAGE_API_KEY,
+    NEWS_BACKFILL_MONTHS,
+    NEWS_BACKFILL_WINDOW_DAYS,
+    NEWS_DAILY_CALL_BUDGET,
+    NEWS_RAW_DIR,
+    NEWS_REQUEST_DELAY_SECONDS,
+    NEWS_TICKERS_PER_CALL,
+    TICKERS,
+)
+
+ALPHA_VANTAGE_URL = "https://www.alphavantage.co/query"
+
+# Alpha Vantage no siempre reconoce los tickers en el mismo formato que
+# yfinance (la fuente ya usada en el resto del pipeline, ver
+# config.TICKERS): las clases de acciones que Yahoo escribe con guion
+# ("BRK-B") Alpha Vantage las espera con punto ("BRK.B"). La traducción se
+# hace solo en la frontera con esta API — daily_prices/stocks/gold_* siguen
+# usando el ticker "canónico" del proyecto (BRK-B) sin tocar nada más.
+TICKER_SYMBOL_OVERRIDES: dict[str, str] = {
+    "BRK-B": "BRK.B",
+}
+_REVERSE_TICKER_OVERRIDES = {v: k for k, v in TICKER_SYMBOL_OVERRIDES.items()}
+
+
+def _to_av_symbol(ticker: str) -> str:
+    return TICKER_SYMBOL_OVERRIDES.get(ticker, ticker)
+
+
+def _from_av_symbol(symbol: str) -> str:
+    return _REVERSE_TICKER_OVERRIDES.get(symbol, symbol)
+
+
+class AlphaVantageQuotaError(RuntimeError):
+    """Cupo de peticiones agotado (diario u otro) — debe parar TODA la
+    ejecución de --backfill, no tiene sentido seguir intentando otros
+    lotes/ventanas si la API ya no va a responder a nada más hoy."""
+
+
+class AlphaVantageRequestError(RuntimeError):
+    """Error de parámetros/petición para ESTE lote+ventana en concreto
+    (p. ej. un ticker que Alpha Vantage no reconoce) — no debe parar el
+    resto de la ejecución, solo este ítem se reintentará más adelante."""
+
+
+def _looks_like_quota_error(message: str) -> bool:
+    m = message.lower()
+    return any(kw in m for kw in ("rate limit", "requests per day", "premium", "frequency", "thank you for using"))
+
+
+def ticker_batches(tickers: list[str] | None = None) -> list[list[str]]:
+    """Trocea `tickers` (por defecto config.TICKERS) en lotes de
+    NEWS_TICKERS_PER_CALL. El índice en la lista resultante (`batch_id`) es
+    solo posicional/informativo para logs — la identidad real de cada lote
+    en `news_backfill_progress` es `_batch_key()` (ver más abajo), no este
+    índice, precisamente porque cambia de significado si NEWS_TICKERS_PER_CALL
+    o TICKERS cambian entre ejecuciones."""
+    tickers = tickers if tickers is not None else TICKERS
+    return [tickers[i : i + NEWS_TICKERS_PER_CALL] for i in range(0, len(tickers), NEWS_TICKERS_PER_CALL)]
+
+
+def _batch_key(tickers_in_batch: list[str]) -> str:
+    """Identidad estable de un lote = hash de sus tickers exactos (no su
+    posición). Si la composición de un lote cambia (porque cambió
+    NEWS_TICKERS_PER_CALL o TICKERS), genera una clave distinta en vez de
+    heredar por error el progreso de un lote con otros tickers — bug real
+    detectado el 2026-07-31 al bajar NEWS_TICKERS_PER_CALL de 50 a 10 (ver
+    CONTEXTO.md y db.py, `_migrate_news_backfill_progress`)."""
+    joined = ",".join(sorted(tickers_in_batch))
+    return hashlib.sha1(joined.encode("utf-8")).hexdigest()[:16]
+
+
+def date_windows(months_back: int, window_days: int, end: dt.date | None = None) -> list[tuple[dt.date, dt.date]]:
+    """Ventanas [inicio, fin) de `window_days` días cubriendo los últimos
+    `months_back` meses, ordenadas de más antigua a más reciente (el
+    backfill prioriza rellenar historia antes que repetir lo más
+    reciente)."""
+    end = end or dt.date.today()
+    start = end - dt.timedelta(days=months_back * 30)
+    windows: list[tuple[dt.date, dt.date]] = []
+    cursor = start
+    while cursor < end:
+        window_end = min(cursor + dt.timedelta(days=window_days), end)
+        windows.append((cursor, window_end))
+        cursor = window_end
+    return windows
+
+
+def _sentiment_label(score: float) -> str:
+    """Mismos umbrales que documenta Alpha Vantage para su propio score."""
+    if score <= -0.35:
+        return "Bearish"
+    if score <= -0.15:
+        return "Somewhat-Bearish"
+    if score < 0.15:
+        return "Neutral"
+    if score < 0.35:
+        return "Somewhat-Bullish"
+    return "Bullish"
+
+
+def fetch_news_batch(tickers: list[str], time_from: dt.date, time_to: dt.date) -> dict:
+    """Una llamada a NEWS_SENTIMENT para varios tickers y una ventana de
+    fechas. Alpha Vantage comunica tanto el cupo agotado como errores de
+    parámetros dentro del cuerpo JSON (claves "Note"/"Information"), no con
+    un código HTTP de error — hay que comprobarlo explícitamente Y
+    distinguir un caso del otro (ver AlphaVantageQuotaError vs
+    AlphaVantageRequestError): un ticker no reconocido no debe tratarse
+    como si se hubiera agotado el cupo del día."""
+    if not ALPHA_VANTAGE_API_KEY:
+        raise RuntimeError(
+            "ALPHA_VANTAGE_API_KEY no configurada — copia .env.example a .env y rellena tu clave "
+            "(gratis en https://www.alphavantage.co/support/#api-key)."
+        )
+
+    params = {
+        "function": "NEWS_SENTIMENT",
+        "tickers": ",".join(_to_av_symbol(t) for t in tickers),
+        "time_from": time_from.strftime("%Y%m%dT0000"),
+        "time_to": time_to.strftime("%Y%m%dT0000"),
+        "limit": 1000,
+        "sort": "RELEVANCE",
+        "apikey": ALPHA_VANTAGE_API_KEY,
+    }
+    resp = requests.get(ALPHA_VANTAGE_URL, params=params, timeout=30)
+    resp.raise_for_status()
+    data = resp.json()
+
+    if "Note" in data or "Information" in data:
+        message = str(data.get("Note") or data.get("Information") or data)
+        if _looks_like_quota_error(message):
+            raise AlphaVantageQuotaError(message)
+        raise AlphaVantageRequestError(message)
+    if "feed" not in data:
+        raise AlphaVantageRequestError(f"respuesta inesperada de Alpha Vantage: {data}")
+    return data
+
+
+def save_raw_json(data: dict, batch_id: int, window_start: dt.date) -> Path:
+    NEWS_RAW_DIR.mkdir(parents=True, exist_ok=True)
+    path = NEWS_RAW_DIR / f"batch{batch_id}_{window_start.isoformat()}.json"
+    path.write_text(json.dumps(data), encoding="utf-8")
+    return path
+
+
+def upsert_articles(data: dict, tickers_in_batch: set[str], engine: Engine) -> int:
+    """Extrae de cada artículo solo el sentimiento específico de los
+    tickers de este lote (un artículo puede mencionar tickers que no
+    pedimos; se ignoran). Devuelve el nº de filas upserted."""
+    rows = []
+    for article in data.get("feed", []):
+        url = article.get("url")
+        time_published = article.get("time_published", "")
+        try:
+            article_date = dt.datetime.strptime(time_published[:8], "%Y%m%d").date()
+        except ValueError:
+            continue
+
+        for ts in article.get("ticker_sentiment", []):
+            # Alpha Vantage devuelve el ticker en SU formato (p. ej.
+            # "BRK.B"); se traduce de vuelta al formato canónico del
+            # proyecto (BRK-B, el mismo que usa daily_prices/stocks) antes
+            # de comprobar/guardar nada.
+            ticker = _from_av_symbol(ts.get("ticker"))
+            if ticker not in tickers_in_batch:
+                continue
+            try:
+                relevance = float(ts.get("relevance_score"))
+                sentiment = float(ts.get("ticker_sentiment_score"))
+            except (TypeError, ValueError):
+                continue
+            rows.append(
+                {
+                    "ticker": ticker,
+                    "url": url,
+                    "date": article_date,
+                    "title": article.get("title"),
+                    "source": article.get("source"),
+                    "relevance_score": relevance,
+                    "ticker_sentiment_score": sentiment,
+                    "ticker_sentiment_label": _sentiment_label(sentiment),
+                    "time_published": time_published,
+                    "fetched_at": dt.datetime.utcnow(),
+                }
+            )
+
+    if not rows:
+        return 0
+
+    with engine.begin() as conn:
+        for row in rows:
+            stmt = sqlite_insert(dbmod.news_articles).values(**row)
+            stmt = stmt.on_conflict_do_update(
+                index_elements=["ticker", "url"],
+                set_={
+                    "relevance_score": stmt.excluded.relevance_score,
+                    "ticker_sentiment_score": stmt.excluded.ticker_sentiment_score,
+                    "ticker_sentiment_label": stmt.excluded.ticker_sentiment_label,
+                    "fetched_at": stmt.excluded.fetched_at,
+                },
+            )
+            conn.execute(stmt)
+    return len(rows)
+
+
+def pending_work_items(engine: Engine) -> list[tuple[int, dt.date, dt.date]]:
+    """(batch_id, window_start, window_end) aún no completados en
+    news_backfill_progress, de más antiguo a más reciente.
+
+    La comprobación de "ya hecho" se hace por `_batch_key(tickers_del_lote)`,
+    no por `batch_id` — ver el comentario en `_batch_key()` y en
+    `db.news_backfill_progress`. Se consulta vía el objeto Table (no SQL
+    crudo con `text()`) para que SQLAlchemy aplique el tipo `Date` al leer
+    `window_start` — con SQL crudo, sqlite3 devuelve la fecha como string y
+    la comparación con los `datetime.date` de `date_windows()` nunca
+    coincidiría."""
+    windows = date_windows(NEWS_BACKFILL_MONTHS, NEWS_BACKFILL_WINDOW_DAYS)
+    batches = ticker_batches()
+    batch_keys = [_batch_key(b) for b in batches]
+
+    with engine.begin() as conn:
+        done = {
+            (row.batch_key, row.window_start)
+            for row in conn.execute(
+                dbmod.news_backfill_progress.select().with_only_columns(
+                    dbmod.news_backfill_progress.c.batch_key,
+                    dbmod.news_backfill_progress.c.window_start,
+                )
+            )
+        }
+
+    items = []
+    for window_start, window_end in windows:
+        for batch_id, key in enumerate(batch_keys):
+            if (key, window_start) not in done:
+                items.append((batch_id, window_start, window_end))
+    return items
+
+
+def mark_done(engine: Engine, batch_id: int, window_start: dt.date, window_end: dt.date) -> None:
+    batches = ticker_batches()
+    key = _batch_key(batches[batch_id])
+    with engine.begin() as conn:
+        stmt = sqlite_insert(dbmod.news_backfill_progress).values(
+            batch_key=key,
+            batch_id=batch_id,
+            window_start=window_start,
+            window_end=window_end,
+            completed_at=dt.datetime.utcnow().isoformat(),
+        )
+        stmt = stmt.on_conflict_do_nothing(index_elements=["batch_key", "window_start"])
+        conn.execute(stmt)
+
+
+def run_backfill(engine: Engine, max_calls: int) -> None:
+    batches = ticker_batches()
+    items = pending_work_items(engine)
+
+    if not items:
+        print("[news] backfill ya completo — no quedan ventanas pendientes.", file=sys.stderr)
+        return
+
+    total_windows = len(date_windows(NEWS_BACKFILL_MONTHS, NEWS_BACKFILL_WINDOW_DAYS)) * len(batches)
+    print(
+        f"[news] {len(items)}/{total_windows} ventanas pendientes (lote de tickers x ventana de fechas). "
+        f"Presupuesto de esta ejecución: {max_calls} llamadas.",
+        file=sys.stderr,
+    )
+
+    calls_made = 0
+    failed_batches: set[int] = set()
+    for batch_id, window_start, window_end in items:
+        if calls_made >= max_calls:
+            break
+        tickers_in_batch = set(batches[batch_id])
+        try:
+            data = fetch_news_batch(list(tickers_in_batch), window_start, window_end)
+            save_raw_json(data, batch_id, window_start)
+            n = upsert_articles(data, tickers_in_batch, engine)
+            mark_done(engine, batch_id, window_start, window_end)
+            print(
+                f"[news] lote {batch_id} ({window_start}→{window_end}): {n} filas de sentimiento guardadas",
+                file=sys.stderr,
+            )
+        except AlphaVantageQuotaError as exc:
+            # Cupo agotado: no tiene sentido seguir gastando llamadas hoy,
+            # se para TODA la ejecución (no solo este ítem).
+            print(f"[news] cupo de Alpha Vantage agotado — parando esta ejecución ({exc})", file=sys.stderr)
+            calls_made += 1
+            break
+        except Exception as exc:  # noqa: BLE001
+            # Error de parámetros de ESTE lote+ventana (p. ej. un ticker
+            # que Alpha Vantage no reconoce) — no se marca como hecho (se
+            # reintenta en la próxima ejecución), pero SÍ seguimos con el
+            # resto de items en esta misma ejecución: un lote roto no debe
+            # bloquear el progreso del resto del backfill.
+            print(
+                f"[news] lote {batch_id} ({window_start}→{window_end}): FALLÓ, se reintentará en la "
+                f"próxima ejecución ({exc})",
+                file=sys.stderr,
+            )
+            failed_batches.add(batch_id)
+
+        calls_made += 1
+        time.sleep(NEWS_REQUEST_DELAY_SECONDS)
+
+    remaining = len(pending_work_items(engine))
+    print(
+        f"[news] {calls_made} llamada(s) hecha(s) en esta ejecución. Quedan {remaining} ventanas pendientes.",
+        file=sys.stderr,
+    )
+    if failed_batches:
+        print(
+            f"[news] AVISO: el/los lote(s) {sorted(failed_batches)} fallaron en TODAS sus ventanas de esta "
+            "ejecución — probablemente un ticker de ese lote no lo reconoce Alpha Vantage (revisa el mensaje "
+            "de error de arriba), no un problema de cupo. No se resolverá solo reintentando.",
+            file=sys.stderr,
+        )
+
+
+def run_daily_update(engine: Engine) -> None:
+    """Actualización incremental: solo ayer→hoy, todos los lotes de
+    tickers. Pensada para ejecutarse a diario una vez completado el
+    backfill (número de llamadas = nº de lotes, ~21 con la config actual —
+    sigue muy por debajo del presupuesto diario de 25)."""
+    batches = ticker_batches()
+    yesterday = dt.date.today() - dt.timedelta(days=1)
+    today = dt.date.today()
+
+    calls_made = 0
+    for batch_id, tickers_in_batch in enumerate(batches):
+        try:
+            data = fetch_news_batch(tickers_in_batch, yesterday, today)
+            save_raw_json(data, batch_id, yesterday)
+            n = upsert_articles(data, set(tickers_in_batch), engine)
+            print(f"[news] lote {batch_id}: {n} filas de sentimiento (actualización diaria)", file=sys.stderr)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[news] lote {batch_id}: FALLÓ la actualización diaria ({exc})", file=sys.stderr)
+        calls_made += 1
+        time.sleep(NEWS_REQUEST_DELAY_SECONDS)
+
+    print(f"[news] actualización diaria: {calls_made} llamada(s) hecha(s)", file=sys.stderr)
+
+
+def run_auto(engine: Engine, max_calls: int) -> None:
+    """Modo pensado para ejecución programada (Task Scheduler/cron), sin
+    intervención manual: mientras queden ventanas de backfill pendientes,
+    avanza el backfill; en cuanto esté completo, cambia solo a la
+    actualización diaria. Así el MISMO comando programado sirve durante las
+    ~3 semanas que tarda el backfill y para siempre después, sin tener que
+    volver a tocar el flag."""
+    if pending_work_items(engine):
+        run_backfill(engine, max_calls=max_calls)
+    else:
+        print("[news] backfill completo — modo automático pasa a actualización diaria.", file=sys.stderr)
+        run_daily_update(engine)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    mode = parser.add_mutually_exclusive_group(required=False)
+    mode.add_argument("--backfill", action="store_true", help="fuerza el backfill histórico")
+    mode.add_argument("--daily", action="store_true", help="fuerza la actualización incremental (ayer→hoy)")
+    parser.add_argument(
+        "--max-calls",
+        type=int,
+        default=NEWS_DAILY_CALL_BUDGET,
+        help="presupuesto de llamadas para esta ejecución (por defecto, config.NEWS_DAILY_CALL_BUDGET)",
+    )
+    args = parser.parse_args(argv)
+
+    engine = dbmod.get_engine()
+    dbmod.init_db(engine)
+    dbmod.seed_stocks(engine, tickers=TICKERS)
+
+    if args.backfill:
+        run_backfill(engine, max_calls=args.max_calls)
+    elif args.daily:
+        run_daily_update(engine)
+    else:
+        # Sin flag: modo automático — es el que debe usar la tarea
+        # programada (ver run_news_daily.bat).
+        run_auto(engine, max_calls=args.max_calls)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

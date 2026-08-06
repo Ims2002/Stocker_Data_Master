@@ -44,6 +44,7 @@ from sqlalchemy import (
     Table,
     create_engine,
     event,
+    text,
 )
 from sqlalchemy.engine import Engine
 
@@ -62,6 +63,15 @@ def _gold_feature_columns() -> list[Column]:
     open/close/adj_close/volume son obligatorios; high/low son deseables
     (no se usan como feature en la primera versión del modelo, ver
     CONTEXTO.md), de ahí que sean nullable.
+
+    Ampliación de features (2026-08-06, ver CONTEXTO.md "Ampliación de
+    features"): rsi_14, macd_line, macd_signal, price_std_20, return_5d,
+    return_20d, volume_ma_10 son valores "crudos" (mismo criterio que
+    ma_5/ma_10/ma_20: se guardan en su unidad nativa y es
+    `model.build_feature_matrix` quien los convierte a variables relativas
+    comparables entre tickers, nunca aquí). day_of_week no depende de
+    ventana histórica (se calcula directo de `date`), por eso es la única
+    de este grupo que no puede quedar NULL.
     """
     return [
         Column("open", Float, nullable=False),
@@ -75,6 +85,14 @@ def _gold_feature_columns() -> list[Column]:
         Column("ma_10", Float, nullable=True),
         Column("ma_20", Float, nullable=True),
         Column("volatility_10d", Float, nullable=True),
+        Column("return_5d", Float, nullable=True),
+        Column("return_20d", Float, nullable=True),
+        Column("rsi_14", Float, nullable=True),
+        Column("macd_line", Float, nullable=True),
+        Column("macd_signal", Float, nullable=True),
+        Column("price_std_20", Float, nullable=True),
+        Column("volume_ma_10", Float, nullable=True),
+        Column("day_of_week", Integer, nullable=False),
     ]
 
 
@@ -155,6 +173,106 @@ predictions = Table(
 )
 
 
+# --- news_articles (processed) — sentimiento por artículo x ticker --------
+# Fuente: Alpha Vantage NEWS_SENTIMENT (decisión explícita del usuario,
+# 2026-07-30, ver CONTEXTO.md — comparada con Finnhub y yfinance.news). Un
+# mismo artículo puede mencionar varios tickers con distinto sentimiento
+# cada uno, de ahí que la PK sea (ticker, url) y no solo `url`: cada fila es
+# "este artículo dice esto sobre este ticker en concreto", no el artículo
+# en sí. El upsert por (ticker, url) hace que ventanas de fechas que se
+# solapan entre sí (o entre backfill y actualización diaria) no dupliquen
+# filas — dedupe natural, sin lógica aparte.
+news_articles = Table(
+    "news_articles",
+    metadata,
+    Column("ticker", String, primary_key=True),
+    Column("url", String, primary_key=True),
+    Column("date", Date, nullable=False),
+    Column("title", String, nullable=True),
+    Column("source", String, nullable=True),
+    Column("relevance_score", Float, nullable=False),
+    Column("ticker_sentiment_score", Float, nullable=False),
+    Column("ticker_sentiment_label", String, nullable=False),
+    Column("time_published", String, nullable=False),
+    Column("fetched_at", DateTime, nullable=False),
+    ForeignKeyConstraint(["ticker"], ["stocks.ticker"]),
+    CheckConstraint(
+        "relevance_score >= 0 AND relevance_score <= 1",
+        name="ck_news_articles_relevance_range",
+    ),
+    CheckConstraint(
+        "ticker_sentiment_score >= -1 AND ticker_sentiment_score <= 1",
+        name="ck_news_articles_sentiment_range",
+    ),
+)
+
+# --- news_backfill_progress — qué (lote de tickers, ventana de fechas) ya
+# se ha pedido a la API. Necesaria porque el free tier de Alpha Vantage (25
+# peticiones/día) no permite completar el backfill de 208 tickers x ~2 años
+# en una sola ejecución — sin esto, cada ejecución repetiría desde el
+# principio en vez de continuar donde se quedó la anterior.
+#
+# La identidad es `batch_key` (hash de los tickers exactos de ese lote), NO
+# `batch_id` (posición del lote en la lista). Motivo real, detectado el
+# 2026-07-31: al bajar config.NEWS_TICKERS_PER_CALL de 50 a 10, el lote
+# "batch_id=4" pasó de significar "los últimos 8 tickers de config.TICKERS"
+# a significar "los tickers 40-49" — un conjunto totalmente distinto. Con
+# `batch_id` como identidad, las 4 filas ya marcadas como hechas bajo la
+# config antigua se habrían seguido leyendo como "hecho" para el batch_id=4
+# NUEVO, saltándose para siempre esos tickers sin que nadie lo notara. Un
+# hash de los tickers del lote no sufre este problema: si la composición
+# del lote cambia, simplemente genera una clave distinta y no colisiona con
+# progreso de otra composición (ver `news._batch_key()`).
+news_backfill_progress = Table(
+    "news_backfill_progress",
+    metadata,
+    Column("batch_key", String, primary_key=True),
+    Column("window_start", Date, primary_key=True),
+    Column("batch_id", Integer, nullable=False),  # solo informativo (logs), no es la clave
+    Column("window_end", Date, nullable=False),
+    Column("completed_at", String, nullable=False),
+)
+
+
+def _migrate_gold_tables(engine: Engine) -> None:
+    """Si `gold_train`/`gold_inference` existen con el esquema antiguo (sin
+    las columnas de la ampliación de features de 2026-08-06 — rsi_14,
+    macd_line, etc., ver `_gold_feature_columns()`), se eliminan y se
+    recrean vacías. Seguro de hacer: a diferencia de `news_articles` (datos
+    caros de volver a pedir a una API con cuota limitada), gold_train/
+    gold_inference son 100% derivadas de `daily_prices` y `gold.py` las
+    recalcula por completo (delete+insert) en cada ejecución — no hay nada
+    que perder que no se regenere solo con `python gold.py`."""
+    with engine.begin() as conn:
+        for table_name in ("gold_train", "gold_inference"):
+            cols = [row[1] for row in conn.execute(text(f"PRAGMA table_info({table_name})"))]
+            if cols and "rsi_14" not in cols:
+                print(
+                    f"[db] {table_name} con esquema antiguo (sin las features nuevas) — se recrea "
+                    "vacía (ver CONTEXTO.md, 'Ampliación de features', 2026-08-06). "
+                    "Ejecuta `python gold.py` después para repoblarla.",
+                    file=sys.stderr,
+                )
+                conn.execute(text(f"DROP TABLE {table_name}"))
+
+
+def _migrate_news_backfill_progress(engine: Engine) -> None:
+    """Si `news_backfill_progress` existe con el esquema antiguo (PK =
+    batch_id, sin columna batch_key), se elimina y se recrea vacía — ver el
+    comentario sobre `batch_key` arriba. Perder esas filas es seguro: como
+    mucho se repiten unas pocas llamadas ya hechas (news_articles dedupe
+    por (ticker, url)), nunca se pierde o corrompe nada."""
+    with engine.begin() as conn:
+        cols = [row[1] for row in conn.execute(text("PRAGMA table_info(news_backfill_progress)"))]
+        if cols and "batch_key" not in cols:
+            print(
+                "[db] news_backfill_progress con esquema antiguo (sin batch_key) — se recrea vacía "
+                "(ver CONTEXTO.md, incidente 2026-07-31).",
+                file=sys.stderr,
+            )
+            conn.execute(text("DROP TABLE news_backfill_progress"))
+
+
 def _enable_sqlite_foreign_keys(engine: Engine) -> None:
     """SQLite ignora las FOREIGN KEY constraints salvo que se activen por
     conexión — sin esto, las ForeignKeyConstraint definidas arriba no se
@@ -176,9 +294,33 @@ def get_engine() -> Engine:
 
 def init_db(engine: Engine | None = None) -> Engine:
     """Crea todas las tablas si no existen. No destruye ni modifica tablas
-    ya existentes (checkfirst=True)."""
+    ya existentes (checkfirst=True).
+
+    También crea la vista `news_sentiment_daily`, que agrega
+    `news_articles` por (ticker, date) — NO es una tabla física (mismo
+    principio que impide recomponer gold_train/gold_inference "por
+    comodidad": una vista no puede quedar nunca desincronizada de la tabla
+    que agrega, porque se recalcula en cada SELECT)."""
     engine = engine or get_engine()
+    _migrate_news_backfill_progress(engine)
+    _migrate_gold_tables(engine)
     metadata.create_all(engine, checkfirst=True)
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                """
+                CREATE VIEW IF NOT EXISTS news_sentiment_daily AS
+                SELECT
+                    ticker,
+                    date,
+                    AVG(ticker_sentiment_score) AS avg_sentiment_score,
+                    AVG(relevance_score) AS avg_relevance_score,
+                    COUNT(*) AS n_articles
+                FROM news_articles
+                GROUP BY ticker, date
+                """
+            )
+        )
     return engine
 
 

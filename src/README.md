@@ -1,9 +1,9 @@
 # src/
 
 Código del pipeline de Stocker, según el diseño ya cerrado en
-[`CONTEXTO.md`](../CONTEXTO.md). Implementados hasta la capa processed
-(config, descarga, esquema y carga); features/gold/modelo/predicción aún
-no — esto describe qué contendrá cada módulo.
+[`CONTEXTO.md`](../CONTEXTO.md). Pipeline completo implementado de punta a
+punta: descarga → carga → features/gold → modelo → predicción. Falta la
+capa de dashboard (fuera de `src/`, ver conversación de diseño).
 
 ## Módulos previstos
 
@@ -11,10 +11,37 @@ no — esto describe qué contendrá cada módulo.
 - **`download.py`** (implementado) — descarga el histórico diario vía `yfinance` (fuente única, ver CONTEXTO.md) y lo vuelca tal cual en `data/raw/` (CSV sin transformar, `auto_adjust=False` para conservar `Close` y `Adj Close` por separado), como copia de auditoría de qué se descargó y cuándo. Pensado para lotes de varios tickers: cada uno se descarga de forma aislada, con reintentos (`config.DOWNLOAD_RETRY_ATTEMPTS`) y una pausa entre tickers (`config.DOWNLOAD_DELAY_SECONDS`) para mitigar rate-limiting; un fallo en un ticker no aborta el resto del lote. Fallback documentado (no activo) en `fallback/yahooquery_download.py` si `yfinance` deja de funcionar.
 - **`db.py`** (implementado) — esquema de las 5 tablas (`stocks`, `daily_prices`, `gold_train`, `gold_inference`, `predictions`) vía SQLAlchemy Core, con las FK y CHECK constraints que refuerzan las reglas de CONTEXTO.md (p. ej. `gold_inference` no tiene columnas de label ni siquiera en el esquema). `gold_train`/`gold_inference` son compartidas por todos los tickers (antes se llamaban `gold_aapl_train`/`gold_aapl_inference`, renombradas al ampliar de un solo ticker a un universo multi-ticker). `init_db()` crea las tablas en `config.DB_PATH` si no existen; `seed_stocks()` inserta una fila en `stocks` por ticker (por defecto los de `config.TICKERS`, pero acepta una lista explícita); `drop_legacy_gold_tables()` es una migración puntual para limpiar las tablas con el nombre antiguo si quedaron de una ejecución previa. Motor: SQLite (decisión confirmada — ver CONTEXTO.md; no MySQL).
 - **`load.py`** (implementado) — lee el CSV raw más reciente de `data/raw/` (uno por ticker) y hace upsert en `daily_prices`: tipado correcto, fechas ISO sin componente horaria, descarte de registros inválidos (Open/Close nulos o ≤0, Volume nulo o negativo) con log de calidad en `data/processed/quality_log.csv`, y validación de huecos contra el calendario de mercado (`pandas_market_calendars`, `config.MARKET_CALENDAR`) — avisa de sesiones de mercado esperadas sin datos (posible fallo de descarga), sin rellenarlas ni descartarlas. Siembra el ticker concreto en `stocks` antes de cargarlo (no depende de que ya esté en `config.TICKERS`). En lote, cada ticker se procesa de forma aislada: un fallo no aborta el resto. No llama a la API directamente: solo consume lo que `download.py` ya volcó en `data/raw/`, para no saltarse la copia de auditoría del pipeline.
-- **`features.py`** (pendiente) — cálculo de `return_1d`, `ma_5`, `ma_10`, `ma_20`, `volatility_10d` sobre `adj_close` (no `close`), usando solo datos de días ≤ t (sin lookahead), por ticker.
-- **`gold.py`** (pendiente) — construcción física y separada de `gold_train` (incluye labels, excluye por construcción, por ticker, la última fecha disponible) y `gold_inference` (solo la última fecha de cada ticker, sin ninguna columna de label).
-- **`model.py`** (pendiente) — entrenamiento y evaluación con split temporal (nunca aleatorio) frente a los baselines obligatorios: clase mayoritaria y persistencia del día anterior.
-- **`predict.py`** (pendiente) — inferencia sobre `gold_aapl_inference` y persistencia obligatoria del resultado en la tabla `predictions`, junto con `model_version`.
+- **`enrich_stocks.py`** (implementado) — rellena `nombre`/`sector`/`pais` en `stocks` vía `Ticker.info` de `yfinance` (misma fuente ya decidida, no una nueva). Las columnas existían en el esquema pero nada las poblaba (`seed_stocks()` solo inserta el `ticker`). Mismo patrón de aislamiento/reintentos por ticker que `download.py`. Noticias/sentimiento es una fuente de datos distinta (Alpha Vantage u otra) y sigue sin implementar, pendiente de decisión explícita — no lo confundas con esto.
+- **`features.py`** (implementado, ampliado 2026-08-06) — librería pura de transformación (no toca la BD), sobre `adj_close` (no `close`) salvo donde se indica, siempre con `rolling`/`ewm` sin lookahead (las primeras filas de cada ticker, sin histórico suficiente, quedan en `NaN` en vez de calcularse con una ventana parcial). Calcula: `return_1d`/`return_5d`/`return_20d` (momentum a distintos plazos), `ma_5`/`ma_10`/`ma_20`, `volatility_10d`, `rsi_14` (RSI con SMA, no EMA — mismo criterio que las medias móviles), `macd_line`/`macd_signal` (MACD 12/26/9, con el warm-up de 33 sesiones enmascarado a mano porque `ewm` no produce NaN por sí solo), `price_std_20` (para reconstruir Bandas de Bollinger junto con `ma_20`), `volume_ma_10` (para volumen relativo) y `day_of_week`. Todas se guardan en su unidad "cruda" — es `model.build_feature_matrix` quien las convierte a variables relativas comparables entre tickers, nunca este módulo. La usa `gold.py`.
+- **`gold.py`** (implementado) — por ticker: lee `daily_prices` (usando `result.keys()`, no una lista de columnas a mano — ver CONTEXTO.md), aplica `features.py`, calcula `close_next_day`/`target_up_down` (`shift(-1)` sobre `Close`, no `adj_close`, tal como fija CONTEXTO.md), y separa en `gold_train` (excluye la última fecha y cualquier fila con features incompletas) y `gold_inference` (solo la última fecha, si tiene features completas). Recalcula por completo (delete + insert) en vez de incremental, para no dejar filas desactualizadas si cambia la lógica de features. Tickers con menos de `config.MIN_HISTORY_ROWS_FOR_GOLD` filas (40, ver CONTEXTO.md — antes 30, subido por el warm-up de MACD) se descartan con aviso, no rompen el lote.
+- **`model.py`** (implementado, features ampliadas 2026-08-06) — **decisión de diseño**: un único modelo agrupado (pooled) sobre `gold_train` de todos los tickers a la vez (no un modelo por ticker) — con 210 tickers son ~500k filas en vez de ~2.500 aisladas, mucha más potencia estadística para una señal ya de por sí débil (ver conversación de diseño y CONTEXTO.md). Split temporal único y global (`config.TEST_PERIOD_MONTHS`, no por ticker). 14 features (`build_feature_matrix`, ver docstring completo ahí y CONTEXTO.md "Ampliación de features"): todas relativas/sin escala (retornos a varios plazos, precio vs. medias móviles, RSI, histograma MACD normalizado por precio, posición/ancho de Bandas de Bollinger, volumen en log y relativo, día de la semana) — nunca niveles de precio en crudo, para que sean comparables entre tickers de precio muy distinto. El ticker en sí NO se usa como feature (ni one-hot ni embedding) en esta primera versión. Modelos disponibles: Random Forest (por defecto) o regresión logística — deliberadamente interpretables, no LSTM (ver conversación de diseño del dashboard: con ~2.500 filas/ticker un LSTM es más caja negra y más propenso a sobreajustar que a aportar señal real). Compara siempre contra los baselines obligatorios (clase mayoritaria del train, persistencia — signo de `return_1d`) y lo reporta tal cual, gane o no. Guarda el modelo entrenado en `models/` (gitignored) con un `model_version` versionado por timestamp.
+- **`news.py`** (implementado) — noticias y sentimiento vía Alpha Vantage `NEWS_SENTIMENT` (fuente nueva, decisión explícita del usuario 2026-07-30 — ver CONTEXTO.md, comparada con Finnhub y `yfinance.news`). Agrupa `config.TICKERS` en lotes (`config.NEWS_TICKERS_PER_CALL`) y trocea el backfill histórico en ventanas de fechas (`config.NEWS_BACKFILL_WINDOW_DAYS`) para respetar el límite de 25 peticiones/día del free tier; el progreso se persiste en `news_backfill_progress` para poder ejecutar `python news.py --backfill` en varios días sin repetir trabajo. Guarda el JSON crudo de cada llamada en `data/raw/news/` (auditoría) y hace upsert en `news_articles` (PK `(ticker, url)`, dedupe natural). `news_sentiment_daily` es una **vista** (no tabla física, ver `db.py`) que agrega `news_articles` por `(ticker, date)`. `python news.py --daily` hace la actualización incremental una vez completado el backfill. Todavía NO se usa como feature del modelo — eso es un paso posterior y deliberado, ver CONTEXTO.md. Requiere `ALPHA_VANTAGE_API_KEY` en `.env` (ver `.env.example`). Sin flags (`python news.py`), corre en modo automático: sigue el backfill si queda pendiente, o pasa solo a `--daily` en cuanto esté completo — es el modo pensado para ejecución programada (ver `run_news_daily.bat` en la raíz del repo y las instrucciones de Task Scheduler más abajo).
+
+### Automatizar `news.py` (Windows Task Scheduler)
+
+El backfill de ~2 años tarda ~21 días de ejecuciones diarias (límite de 25 peticiones/día del free tier de Alpha Vantage, ver CONTEXTO.md) — para no tener que acordarte de lanzarlo a mano cada día, prográmalo una vez:
+
+1. Abre PowerShell o cmd como administrador.
+2. Ejecuta (ajusta la ruta si el repo está en otro sitio):
+   ```
+   schtasks /create /tn "Stocker_Noticias_Diarias" /tr "C:\Users\imsmo\Documents\Claude Projects\stocker_project\run_news_daily.bat" /sc daily /st 07:00
+   ```
+3. Verifica que se creó: `schtasks /query /tn "Stocker_Noticias_Diarias"`.
+4. Para probarlo ya, sin esperar a las 07:00: doble clic en `run_news_daily.bat` (o `schtasks /run /tn "Stocker_Noticias_Diarias"`), y revisa `data\news_cron.log`.
+
+Para desactivarlo más adelante: `schtasks /delete /tn "Stocker_Noticias_Diarias" /f`.
+
+**Si el ordenador está apagado a la hora programada, esa ejecución se salta por defecto** (no se recupera sola). Para que sí la recupere en cuanto se encienda el PC, activa `StartWhenAvailable` (PowerShell, sin recrear la tarea):
+```powershell
+$task = Get-ScheduledTask -TaskName "Stocker_Noticias_Diarias"
+$task.Settings.StartWhenAvailable = $true
+Set-ScheduledTask -TaskName "Stocker_Noticias_Diarias" -Settings $task.Settings
+```
+Ningún día perdido rompe ni repite trabajo: el progreso vive en `news_backfill_progress`, así que solo se retrasa.
+
+**Para comprobar si se ha ejecutado**: revisa el final de `data\news_cron.log` (misma salida que verías lanzándolo a mano), o `schtasks /query /tn "Stocker_Noticias_Diarias" /v /fo list` (da "Last Run Time"/"Last Result"/"Next Run Time" sin abrir el log).
+
+- **`predict.py`** (implementado) — cargar el modelo más reciente (o uno concreto por `model_version`), predecir sobre `gold_inference`, calcular `date_predicha` como la siguiente sesión de mercado real (`pandas_market_calendars`, nunca "+1 día natural" a secas) y hacer upsert en `predictions`. `actual_target_up_down` se deja sin rellenar (se completa más adelante, en un módulo aparte, cruzando con el cierre real de `daily_prices`).
 
 ## Reglas ya decididas que no deben reinterpretarse
 
@@ -25,3 +52,9 @@ Ver `CONTEXTO.md` para el diseño completo. En particular:
 - Al agregar OHLC, `Open` = primer valor, `High` = máximo, `Low` = mínimo, `Close` = último valor, `Volume` = suma — nunca `.mean()`.
 - Cualquier split train/test sobre `gold_train` es cronológico, nunca aleatorio, y no debe mezclar fechas de distintos tickers de forma que se filtre información entre ellos.
 - En descargas/cargas por lotes, un fallo en un ticker no debe abortar el resto — cada ticker se procesa de forma aislada (ver `download.py`/`load.py`).
+- El modelo es agrupado (pooled) sobre todos los tickers, no uno por ticker — no lo dupliques en 210 modelos sin repasar antes la conversación de diseño que justifica esta decisión.
+- Todavía no hay ningún módulo que rellene `predictions.actual_target_up_down` una vez se conoce el cierre real — pendiente, necesario para medir rendimiento real vs. backtest (ver CONTEXTO.md).
+
+## Estado tras la primera ejecución real completa (2026-07-30)
+
+Pipeline verificado de punta a punta sobre los 208 tickers reales (no sintéticos) — ver detalle y resultado del modelo en la sección "Estado real del pipeline" de `CONTEXTO.md`. Pendientes de limpieza detectados (no bloqueantes, ver CONTEXTO.md para el detalle): 5 filas huérfanas en `stocks` (tickers ya corregidos: FI, MMC, BK, DFS, HES), tablas legacy `gold_aapl_train`/`gold_aapl_inference` aún sin eliminar físicamente (llamar a `db.drop_legacy_gold_tables()`), `FISV` sin `sector`/`pais` en `stocks`.

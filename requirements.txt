@@ -6,6 +6,12 @@ pandas
 sqlalchemy
 scikit-learn
 pandas_market_calendars
+joblib
+numpy
+requests
+python-dotenv
+streamlit
+plotly
 
 # Opcional — solo si se activa el fallback de descarga en
 # src/fallback/yahooquery_download.py (yfinance sigue siendo la fuente

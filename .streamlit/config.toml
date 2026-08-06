@@ -1,0 +1,23 @@
+# Tema visual del dashboard — minimalista, base blanca con acentos azul/negro
+# (mockup aprobado por el usuario 2026-08-06, ver CONTEXTO.md). No tocar los
+# colores sin actualizar también dashboard/ui.py (CSS) y CONTEXTO.md.
+
+[theme]
+base = "light"
+primaryColor = "#1D4ED8"
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F8F9FA"
+textColor = "#0B0F19"
+font = "sans serif"
+
+[client]
+# Oculta el menú hamburguesa y el botón "Deploy" — no aportan nada en un
+# proyecto local y rompen la estética minimalista (ver CONTEXTO.md).
+toolbarMode = "minimal"
+# La navegación real va en la barra superior (st.navigation(position="top")
+# en Inicio.py), no en la sidebar — así que no hace falta la sidebar en
+# absoluto.
+showSidebarNavigation = false
+
+[browser]
+gatherUsageStats = false

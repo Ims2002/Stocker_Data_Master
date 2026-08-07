@@ -18,12 +18,17 @@ escalar a ~50 tickers). Al final se informa de qué tickers fallaron, si
 alguno lo hizo.
 
 Uso:
-    python download.py                  # descarga todos los TICKERS de config.py
-    python download.py AAPL MSFT        # descarga tickers concretos
+    python download.py                  # backfill completo (HISTORY_PERIOD) de todos los TICKERS
+    python download.py AAPL MSFT        # backfill completo de tickers concretos
+    python download.py --daily          # solo los últimos DOWNLOAD_DAILY_LOOKBACK_DAYS días
+                                         # (uso pensado para la tarea programada diaria,
+                                         # ver run_daily_pipeline.bat — NO vuelve a pedir
+                                         # el histórico completo cada día)
 """
 
 from __future__ import annotations
 
+import argparse
 import datetime as dt
 import sys
 import time
@@ -37,6 +42,7 @@ import yfinance as yf
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from config import (  # noqa: E402
     DEFAULT_TICKER,
+    DOWNLOAD_DAILY_LOOKBACK_DAYS,
     DOWNLOAD_DELAY_SECONDS,
     DOWNLOAD_RETRY_ATTEMPTS,
     DOWNLOAD_RETRY_BACKOFF_SECONDS,
@@ -48,11 +54,16 @@ from config import (  # noqa: E402
 )
 
 
-def download_ticker_history(ticker: str = DEFAULT_TICKER) -> pd.DataFrame:
+def download_ticker_history(ticker: str = DEFAULT_TICKER, days: int | None = None) -> pd.DataFrame:
     """Descarga el histórico diario OHLCV de `ticker` vía yfinance.
 
-    Usa HISTORY_PERIOD (config.py) si no hay HISTORY_START definido; si
-    HISTORY_START sí está definido, se usa el rango start/end explícito.
+    Tres modos, en este orden de prioridad:
+    - `days` (uso diario, ver `--daily`): solo desde hoy - `days` hasta hoy
+      — evita repetir la descarga completa cada día (ver
+      config.DOWNLOAD_DAILY_LOOKBACK_DAYS para el porqué del margen).
+    - `HISTORY_START` (config.py): rango explícito start/end.
+    - `HISTORY_PERIOD` (config.py, por defecto "10y"): backfill completo,
+      pensado para la primera carga de un ticker, no para uso diario.
 
     `auto_adjust=False` es intencional: se necesita conservar `Close` y
     `Adj Close` como columnas separadas (CONTEXTO.md usa `Adj Close` para
@@ -60,7 +71,10 @@ def download_ticker_history(ticker: str = DEFAULT_TICKER) -> pd.DataFrame:
     """
     t = yf.Ticker(ticker)
 
-    if HISTORY_START:
+    if days is not None:
+        start = (dt.date.today() - dt.timedelta(days=days)).isoformat()
+        df = t.history(start=start, interval="1d", auto_adjust=False)
+    elif HISTORY_START:
         df = t.history(start=HISTORY_START, end=HISTORY_END, interval="1d", auto_adjust=False)
     else:
         df = t.history(period=HISTORY_PERIOD, interval="1d", auto_adjust=False)
@@ -87,7 +101,7 @@ def save_raw_csv(df: pd.DataFrame, ticker: str = DEFAULT_TICKER) -> Path:
     return path
 
 
-def download_ticker_with_retry(ticker: str) -> pd.DataFrame:
+def download_ticker_with_retry(ticker: str, days: int | None = None) -> pd.DataFrame:
     """Reintenta la descarga de un ticker hasta DOWNLOAD_RETRY_ATTEMPTS
     veces, con una pausa entre intentos. Propaga la última excepción si
     se agotan los reintentos (el llamador decide si eso debe tumbar todo
@@ -95,7 +109,7 @@ def download_ticker_with_retry(ticker: str) -> pd.DataFrame:
     last_exc: Exception | None = None
     for attempt in range(1, DOWNLOAD_RETRY_ATTEMPTS + 1):
         try:
-            return download_ticker_history(ticker)
+            return download_ticker_history(ticker, days=days)
         except Exception as exc:  # noqa: BLE001 — se relanza si se agotan los intentos
             last_exc = exc
             print(
@@ -108,16 +122,26 @@ def download_ticker_with_retry(ticker: str) -> pd.DataFrame:
     raise last_exc
 
 
-def main(tickers: list[str] | None = None) -> int:
+def main(argv: list[str] | None = None) -> int:
     """Descarga cada ticker de forma aislada: un fallo (tras agotar
     reintentos) se registra y se pasa al siguiente ticker, no aborta el
     lote completo. Devuelve el nº de tickers que fallaron (0 = todo bien)."""
-    targets = tickers or TICKERS
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("tickers", nargs="*", help="Tickers a descargar (por defecto, config.TICKERS)")
+    parser.add_argument(
+        "--daily",
+        action="store_true",
+        help="solo los últimos DOWNLOAD_DAILY_LOOKBACK_DAYS días, no el histórico completo (uso diario)",
+    )
+    args = parser.parse_args(argv)
+
+    targets = args.tickers or TICKERS
+    days = DOWNLOAD_DAILY_LOOKBACK_DAYS if args.daily else None
     failed: list[str] = []
 
     for i, ticker in enumerate(targets):
         try:
-            df = download_ticker_with_retry(ticker)
+            df = download_ticker_with_retry(ticker, days=days)
             save_raw_csv(df, ticker)
         except Exception as exc:  # noqa: BLE001
             print(f"[download] {ticker}: DESCARTADO tras agotar reintentos ({exc})", file=sys.stderr)
@@ -135,4 +159,4 @@ def main(tickers: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main(sys.argv[1:] or None))
+    raise SystemExit(main(sys.argv[1:]))

@@ -82,6 +82,19 @@ TICKERS = [
 ]
 DEFAULT_TICKER = TICKERS[0]
 
+# Descarga diaria (cron/tarea programada, ver run_daily_pipeline.bat): NO
+# tiene sentido volver a pedir HISTORY_PERIOD (10 años) completo cada día
+# para los 210 tickers — es una llamada a yfinance mucho más pesada de lo
+# necesario, y cada ejecución escribiría en data/raw/ un CSV nuevo de
+# ~2.500 filas por ticker, para siempre, solo para traer 1 fila realmente
+# nueva. `download.py --daily` usa esta ventana corta en vez de
+# HISTORY_PERIOD. Se deja margen sobre "ayer" (no solo 1-2 días) para
+# cubrir fines de semana, festivos de mercado y algún día que la tarea
+# programada no llegara a ejecutarse (PC apagado) sin perder ninguna
+# sesión — el solape con lo que ya hay en daily_prices es inofensivo
+# porque load.py hace upsert por (ticker, date), nunca duplica.
+DOWNLOAD_DAILY_LOOKBACK_DAYS = 10
+
 # --- Robustez de la descarga en lote ---
 # Relevante al escalar de 1 a decenas de tickers: yfinance no es una API
 # oficial y puede aplicar rate-limiting si se piden muchos tickers seguidos
@@ -154,32 +167,45 @@ ALPHA_VANTAGE_API_KEY = os.environ.get("ALPHA_VANTAGE_API_KEY", "")
 NEWS_DAILY_CALL_BUDGET = 25
 NEWS_REQUEST_DELAY_SECONDS = 2  # pausa entre llamadas dentro de una misma ejecución
 
-# 208 tickers agrupados de NEWS_TICKERS_PER_CALL en NEWS_TICKERS_PER_CALL
-# por llamada (comma-separated en el parámetro `tickers` de la API).
-#
-# EMPÍRICO (no documentado por Alpha Vantage, descubierto en ejecución real
-# el 2026-07-30 — ver CONTEXTO.md): con 50 tickers por llamada, la API
-# devuelve "Invalid inputs" de forma consistente en TODOS los lotes de 50,
-# incluidos los que no contienen ningún ticker con formato raro (se probó
-# la hipótesis de que era `BRK-B` y quedó descartada: los lotes 1-3, sin
-# `BRK-B`, fallaron igual). El único lote que funcionó fue el último, de
-# solo 8 tickers (el resto de dividir 208/50). Conclusión: el límite real
-# de tickers por llamada está en algún punto entre 8 y 50 — se deja en 10
-# como valor conservador hasta confirmar el límite exacto (subir este
-# número ahorraría llamadas, pero cada intento fallido gasta una llamada
-# real del cupo diario, así que no merece la pena tantear a ciegas).
-NEWS_TICKERS_PER_CALL = 10
+# CORREGIDO 2026-08-06 — bug de diseño real, no de cupo (ver CONTEXTO.md,
+# "Rediseño de noticias: 1 ticker por llamada"). Se agrupaban
+# NEWS_TICKERS_PER_CALL tickers por llamada (comma-separated en el
+# parámetro `tickers` de la API) asumiendo semántica OR ("noticias de
+# cualquiera de estos tickers"). Evidencia real: de los 27 ficheros JSON
+# guardados hasta la fecha (distintos lotes de 10 mega-caps, distintas
+# ventanas desde 2024-08), TODOS devolvieron "feed": [] — cero artículos,
+# algo estadísticamente imposible para un mes de noticias de NVDA/AAPL/
+# MSFT/AMZN/... si el filtro fuera OR. La hipótesis mejor respaldada es
+# que `tickers` usa semántica AND (el artículo debe mencionar TODOS los
+# tickers del lote a la vez), lo que hace casi imposible que un lote de 10
+# tickers no relacionados devuelva nada. No confirmado en la documentación
+# oficial (contenido no accesible vía fetch, cargado por JS), pero la
+# evidencia empírica es contundente (0/27). Cupo demasiado escaso para
+# gastarlo en más pruebas: se corrige directamente a 1 ticker por llamada,
+# que es la única composición que garantiza intersección no vacía.
+NEWS_TICKERS_PER_CALL = 1
 
-# Backfill inicial: profundidad máxima razonable en el free tier (~2 años,
-# decisión explícita del usuario), en ventanas de NEWS_BACKFILL_WINDOW_DAYS
-# días para no agotar el límite de artículos por llamada de golpe. Con la
-# configuración por defecto: 21 lotes de tickers (208/10) x ~24 ventanas
-# mensuales ≈ 504 llamadas ≈ ~21 días de ejecuciones a
-# NEWS_DAILY_CALL_BUDGET/día (más lento que la estimación inicial de ~5
-# días, hecha antes de descubrir el límite real de tickers por llamada).
-# El progreso se guarda en la tabla news_backfill_progress para poder parar
-# y retomar entre ejecuciones (ver src/news.py).
-NEWS_BACKFILL_MONTHS = 24
-NEWS_BACKFILL_WINDOW_DAYS = 30
+# Backfill inicial: 6 meses (decisión explícita del usuario, 2026-08-06,
+# suficiente para el propósito del proyecto y mucho más rápido de
+# conseguir tras el fix de arriba). NEWS_BACKFILL_WINDOW_DAYS = 180 cubre
+# los 6 meses en una sola ventana por ticker, así que con
+# NEWS_TICKERS_PER_CALL = 1 el backfill completo son exactamente 208
+# llamadas (una por ticker) ≈ 9 días de ejecuciones a
+# NEWS_DAILY_CALL_BUDGET/día — más llamadas totales que antes por ticker,
+# pero cada una con datos reales en vez de 0 artículos garantizados, y en
+# menos tiempo que el plan anterior (~21 días) porque ya no hay lotes de
+# 10 ventanas mensuales por ticker, solo 1. Riesgo aceptado: `limit=1000`
+# de la API por llamada podría truncar tickers muy mediáticos (TSLA,
+# NVDA) si superan 1000 artículos en 6 meses — con sort=RELEVANCE se
+# quedarían los más relevantes según el propio scoring de Alpha Vantage,
+# no un recorte cronológico arbitrario.
+# El progreso se guarda en la tabla news_backfill_progress para poder
+# parar y retomar entre ejecuciones (ver src/news.py). Los lotes antiguos
+# (de 10 tickers) quedan huérfanos de forma natural: `_batch_key()` es un
+# hash de la composición exacta del lote, así que un lote de 1 ticker
+# nunca coincide con la clave de un lote de 10 — no hace falta migrar ni
+# borrar nada a mano.
+NEWS_BACKFILL_MONTHS = 6
+NEWS_BACKFILL_WINDOW_DAYS = 180
 
 NEWS_RAW_DIR = DATA_DIR / "raw" / "news"

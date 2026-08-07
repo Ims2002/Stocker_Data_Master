@@ -37,16 +37,20 @@ import db as dbmod  # noqa: E402
 from config import MARKET_CALENDAR, MODELS_DIR  # noqa: E402
 from model import build_feature_matrix  # noqa: E402
 
-_GOLD_INFERENCE_COLUMNS = [
-    "ticker", "date", "open", "high", "low", "close", "adj_close", "volume",
-    "return_1d", "ma_5", "ma_10", "ma_20", "volatility_10d",
-]
-
-
 def read_gold_inference(engine: Engine) -> pd.DataFrame:
+    """Usa `result.keys()` (no una lista de columnas a mano) para los
+    nombres de columna — igual que `model.read_gold_train`,
+    `gold.read_daily_prices` y `dashboard/data_access.get_gold_train_for_ticker`
+    (ver CONTEXTO.md, "Ampliación de features", 2026-08-06). Antes de este
+    cambio, esta lista se había quedado con el esquema de 13 columnas de
+    antes de esa ampliación — un bug real que habría asignado mal los
+    nombres de las columnas nuevas de gold_inference en la próxima
+    ejecución."""
     with engine.begin() as conn:
-        rows = conn.execute(dbmod.gold_inference.select()).fetchall()
-    return pd.DataFrame(rows, columns=_GOLD_INFERENCE_COLUMNS)
+        result = conn.execute(dbmod.gold_inference.select())
+        rows = result.fetchall()
+        columns = result.keys()
+    return pd.DataFrame(rows, columns=columns)
 
 
 def latest_model_path() -> Path:

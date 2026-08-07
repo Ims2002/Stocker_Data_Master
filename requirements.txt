@@ -13,6 +13,12 @@ python-dotenv
 streamlit
 plotly
 
+# Opcional — solo si se usa `python model.py --model lightgbm` (con o sin
+# --tune). El resto del pipeline (random_forest, logistic) no depende de
+# esto — import perezoso dentro de model.py, ver CONTEXTO.md "Plan B:
+# Gradient Boosting".
+lightgbm
+
 # Opcional — solo si se activa el fallback de descarga en
 # src/fallback/yahooquery_download.py (yfinance sigue siendo la fuente
 # principal, ver CONTEXTO.md). No se instala por defecto:

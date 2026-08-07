@@ -10,12 +10,19 @@ generoso pero sentimiento de pago) y yfinance.news (sin dependencia nueva
 pero sin histórico ni score).
 
 Limitación real y aceptada: el free tier de Alpha Vantage son
-NEWS_DAILY_CALL_BUDGET peticiones/día EN TOTAL. Con 208 tickers agrupados
-de NEWS_TICKERS_PER_CALL en NEWS_TICKERS_PER_CALL, completar el backfill de
-NEWS_BACKFILL_MONTHS meses lleva varias ejecuciones en varios días — el
-progreso se persiste en `news_backfill_progress` (tabla) para poder parar y
-retomar sin repetir trabajo ya hecho ni desperdiciar presupuesto de
-peticiones.
+NEWS_DAILY_CALL_BUDGET peticiones/día EN TOTAL. Con NEWS_TICKERS_PER_CALL
+tickers por llamada, completar el backfill de NEWS_BACKFILL_MONTHS meses
+lleva varias ejecuciones en varios días — el progreso se persiste en
+`news_backfill_progress` (tabla) para poder parar y retomar sin repetir
+trabajo ya hecho ni desperdiciar presupuesto de peticiones.
+
+CORREGIDO 2026-08-06: NEWS_TICKERS_PER_CALL bajó de 10 a 1 (ver
+config.py) tras descubrir que agrupar varios tickers por llamada
+devolvía sistemáticamente 0 artículos (probable semántica AND del
+parámetro `tickers`, no OR — ver comentario junto a NEWS_TICKERS_PER_CALL
+en config.py para el detalle y la evidencia). `ticker_batches()` sigue
+aceptando cualquier tamaño de lote sin cambios de código, simplemente
+ahora se le pide tamaño 1.
 
 Capas, igual que el resto del pipeline (raw → processed):
 - raw: volcado JSON tal cual de cada llamada, en data/raw/news/ (auditoría,
@@ -66,15 +73,20 @@ from config import (  # noqa: E402
 
 ALPHA_VANTAGE_URL = "https://www.alphavantage.co/query"
 
-# Alpha Vantage no siempre reconoce los tickers en el mismo formato que
-# yfinance (la fuente ya usada en el resto del pipeline, ver
-# config.TICKERS): las clases de acciones que Yahoo escribe con guion
-# ("BRK-B") Alpha Vantage las espera con punto ("BRK.B"). La traducción se
-# hace solo en la frontera con esta API — daily_prices/stocks/gold_* siguen
-# usando el ticker "canónico" del proyecto (BRK-B) sin tocar nada más.
-TICKER_SYMBOL_OVERRIDES: dict[str, str] = {
-    "BRK-B": "BRK.B",
-}
+# CORREGIDO 2026-08-06 — la asunción de abajo era errónea. Se pensó que
+# Alpha Vantage esperaba las clases de acciones con punto ("BRK.B") en vez
+# de guion ("BRK-B", formato de Yahoo/yfinance, usado en config.TICKERS),
+# y se mapeaba BRK-B -> BRK.B antes de cada llamada. En una ejecución real
+# (ver CONTEXTO.md, log del 2026-08-06) la propia API devolvió el error:
+# "Invalid ticker format: BRK.B. Ticker can only contain alphanumeric
+# characters, colons, underscores, and hyphens" — es decir, el punto es
+# justo el carácter que Alpha Vantage NO acepta; el guion sí está en su
+# lista de caracteres permitidos. Se elimina el mapeo: BRK-B se envía tal
+# cual, sin traducir. El mecanismo de override se deja vacío (en vez de
+# borrado) por si algún otro ticker necesita uno en el futuro — la
+# frontera de traducción con esta API sigue existiendo, solo que ahora no
+# hace falta para ningún ticker del universo actual.
+TICKER_SYMBOL_OVERRIDES: dict[str, str] = {}
 _REVERSE_TICKER_OVERRIDES = {v: k for k, v in TICKER_SYMBOL_OVERRIDES.items()}
 
 
@@ -373,17 +385,30 @@ def run_backfill(engine: Engine, max_calls: int) -> None:
         )
 
 
-def run_daily_update(engine: Engine) -> None:
-    """Actualización incremental: solo ayer→hoy, todos los lotes de
-    tickers. Pensada para ejecutarse a diario una vez completado el
-    backfill (número de llamadas = nº de lotes, ~21 con la config actual —
-    sigue muy por debajo del presupuesto diario de 25)."""
+def run_daily_update(engine: Engine, max_calls: int = NEWS_DAILY_CALL_BUDGET) -> None:
+    """Actualización incremental: solo ayer→hoy.
+
+    CORREGIDO 2026-08-06: con NEWS_TICKERS_PER_CALL=1 hay 208 lotes (uno
+    por ticker), no ~21 como cuando se agrupaban 10 tickers por llamada —
+    procesarlos todos en una ejecución superaría 8 veces el presupuesto
+    diario (NEWS_DAILY_CALL_BUDGET=25). Esta función ahora tope a
+    `max_calls` por ejecución y elige un subconjunto ALEATORIO de tickers
+    cada vez (en vez de round-robin con estado persistido, más simple de
+    mantener): en expectativa cada ticker se revisa cada ~208/25 ≈ 8-9
+    días, no a diario estricto. Se acepta este trade-off (frescura de
+    noticias más laxa) en vez de meter una tabla de cursor/estado nueva
+    solo para esto — si en el futuro hace falta un ciclo estrictamente
+    round-robin, es el punto a revisar."""
+    import random
+
     batches = ticker_batches()
+    sample_size = min(max_calls, len(batches))
+    sampled = random.sample(list(enumerate(batches)), sample_size)
     yesterday = dt.date.today() - dt.timedelta(days=1)
     today = dt.date.today()
 
     calls_made = 0
-    for batch_id, tickers_in_batch in enumerate(batches):
+    for batch_id, tickers_in_batch in sampled:
         try:
             data = fetch_news_batch(tickers_in_batch, yesterday, today)
             save_raw_json(data, batch_id, yesterday)
@@ -394,21 +419,26 @@ def run_daily_update(engine: Engine) -> None:
         calls_made += 1
         time.sleep(NEWS_REQUEST_DELAY_SECONDS)
 
-    print(f"[news] actualización diaria: {calls_made} llamada(s) hecha(s)", file=sys.stderr)
+    print(
+        f"[news] actualización diaria: {calls_made} llamada(s) hecha(s) de {len(batches)} tickers "
+        "totales (muestra aleatoria, ver docstring de run_daily_update).",
+        file=sys.stderr,
+    )
 
 
 def run_auto(engine: Engine, max_calls: int) -> None:
     """Modo pensado para ejecución programada (Task Scheduler/cron), sin
     intervención manual: mientras queden ventanas de backfill pendientes,
     avanza el backfill; en cuanto esté completo, cambia solo a la
-    actualización diaria. Así el MISMO comando programado sirve durante las
-    ~3 semanas que tarda el backfill y para siempre después, sin tener que
+    actualización diaria. Así el MISMO comando programado sirve durante los
+    ~9 días que tarda el backfill (208 tickers x 1 llamada, ver
+    config.NEWS_TICKERS_PER_CALL) y para siempre después, sin tener que
     volver a tocar el flag."""
     if pending_work_items(engine):
         run_backfill(engine, max_calls=max_calls)
     else:
         print("[news] backfill completo — modo automático pasa a actualización diaria.", file=sys.stderr)
-        run_daily_update(engine)
+        run_daily_update(engine, max_calls=max_calls)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -431,7 +461,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.backfill:
         run_backfill(engine, max_calls=args.max_calls)
     elif args.daily:
-        run_daily_update(engine)
+        run_daily_update(engine, max_calls=args.max_calls)
     else:
         # Sin flag: modo automático — es el que debe usar la tarea
         # programada (ver run_news_daily.bat).

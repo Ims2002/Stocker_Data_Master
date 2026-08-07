@@ -217,6 +217,19 @@ def _build_model(model_type: str):
         )
     if model_type == "logistic":
         return LogisticRegression(max_iter=1000, class_weight="balanced")
+    if model_type == "lightgbm":
+        # Import perezoso: lightgbm es una dependencia OPCIONAL (ver
+        # requirements.txt) — el resto del pipeline (random_forest,
+        # logistic) no debe dejar de funcionar si no está instalada.
+        # Hiperparámetros por defecto razonables, sin tuning — para tuning
+        # de verdad usar `tune_lightgbm()` / `--model lightgbm --tune`.
+        from lightgbm import LGBMClassifier
+
+        return LGBMClassifier(
+            n_estimators=300, num_leaves=31, learning_rate=0.05,
+            min_child_samples=50, class_weight="balanced",
+            random_state=42, n_jobs=-1, verbosity=-1,
+        )
     raise ValueError(f"model_type desconocido: {model_type!r}")
 
 
@@ -259,6 +272,142 @@ def train_and_evaluate(df: pd.DataFrame, model_type: str = "random_forest") -> d
     }
 
 
+def _time_series_folds(df: pd.DataFrame, n_splits: int = 3) -> list[tuple[pd.Series, pd.Series]]:
+    """Cortes cronológicos (ventana creciente / walk-forward) para tuning
+    de hiperparámetros, DENTRO del train oficial únicamente (nunca ve el
+    test real). Un k-fold aleatorio normal (p. ej. `StratifiedKFold`,
+    la técnica de los apuntes de referencia del usuario para tuning
+    general) mezclaría fechas futuras dentro del "entrenamiento" de cada
+    fold — rompería la misma regla de "nunca mezclar pasado y futuro" que
+    ya rige `temporal_split` (ver CONTEXTO.md, "Contrato de evaluación").
+
+    Fold i usa como entrenamiento todos los bloques cronológicos 0..i, y
+    como validación el bloque i+1 (ventana creciente, no bloques fijos de
+    tamaño igual desconectados entre sí) — así cada fold sigue pareciendo
+    "predecir el futuro cercano a partir de todo el pasado disponible
+    hasta ese punto", igual que el problema real.
+
+    Devuelve máscaras booleanas (no arrays de posiciones) para poder
+    indexar `df` directamente con `df[mask]` sin depender de que el
+    índice esté reseteado."""
+    dates = np.sort(df["date"].unique())
+    blocks = np.array_split(dates, n_splits + 1)
+    folds = []
+    for i in range(n_splits):
+        train_dates = set(np.concatenate(blocks[: i + 1]))
+        val_dates = set(blocks[i + 1])
+        train_mask = df["date"].isin(train_dates)
+        val_mask = df["date"].isin(val_dates)
+        folds.append((train_mask, val_mask))
+    return folds
+
+
+# Espacio de búsqueda de hiperparámetros para LightGBM — rangos habituales
+# de la industria, no ajustados a mano para este dataset en concreto (eso
+# es precisamente lo que hace la búsqueda). `class_weight="balanced"` se
+# deja fijo (no en el espacio de búsqueda) para poder comparar con
+# random_forest en igualdad de condiciones, ya que ese también lo usa fijo.
+_LGB_SEARCH_SPACE: dict[str, list] = {
+    "num_leaves": [15, 31, 63, 127],
+    "max_depth": [-1, 4, 6, 8],
+    "learning_rate": [0.01, 0.03, 0.05, 0.1],
+    "n_estimators": [100, 200, 400],
+    "min_child_samples": [20, 50, 100, 200],
+    "feature_fraction": [0.6, 0.8, 1.0],
+    "bagging_fraction": [0.6, 0.8, 1.0],
+}
+
+
+def _sample_lgb_params(rng: np.random.Generator) -> dict:
+    return {name: rng.choice(values).item() for name, values in _LGB_SEARCH_SPACE.items()}
+
+
+def _make_lgbm(params: dict, random_state: int):
+    from lightgbm import LGBMClassifier
+
+    kwargs = dict(params)
+    # bagging_fraction no hace nada en LightGBM sin bagging_freq > 0 — se
+    # activa automáticamente cuando el valor muestreado implica submuestreo.
+    kwargs["bagging_freq"] = 1 if kwargs.get("bagging_fraction", 1.0) < 1.0 else 0
+    return LGBMClassifier(
+        **kwargs, class_weight="balanced", random_state=random_state, n_jobs=-1, verbosity=-1,
+    )
+
+
+def tune_lightgbm(df: pd.DataFrame, n_iter: int = 20, n_splits: int = 3, random_state: int = 42) -> dict:
+    """Búsqueda aleatoria de hiperparámetros para LightGBM con validación
+    cronológica walk-forward (`_time_series_folds`, nunca k-fold
+    aleatorio). Evalúa `n_iter` combinaciones sobre el TRAIN oficial (el
+    mismo `temporal_split` que usa cualquier otro model_type), se queda
+    con la de mejor accuracy media en los folds, la reentrena sobre TODO
+    el train oficial, y la evalúa sobre el mismo test real que los demás
+    modelos — comparación justa: el test real no se toca ni una sola vez
+    durante la búsqueda de hiperparámetros, solo al final.
+
+    Devuelve el mismo formato que `train_and_evaluate()` (compatible con
+    `save_model`/`print_report`), más `best_params`, `cv_best_val_accuracy`
+    y `tuning_trials` (todas las combinaciones probadas, para auditar la
+    búsqueda a posteriori en vez de solo confiar en la ganadora)."""
+    train_df, test_df = temporal_split(df)
+    if train_df.empty or test_df.empty:
+        raise ValueError(
+            "Split temporal vacío (train o test): ¿hay suficiente histórico "
+            f"en gold_train para separar los últimos {TEST_PERIOD_MONTHS} meses?"
+        )
+
+    folds = _time_series_folds(train_df, n_splits=n_splits)
+    rng = np.random.default_rng(random_state)
+
+    best_params: dict | None = None
+    best_score = -1.0
+    trials: list[dict] = []
+    for _ in range(n_iter):
+        params = _sample_lgb_params(rng)
+        fold_scores = []
+        for train_mask, val_mask in folds:
+            x_tr = build_feature_matrix(train_df[train_mask])
+            y_tr = train_df.loc[train_mask, "target_up_down"].astype(int)
+            x_val = build_feature_matrix(train_df[val_mask])
+            y_val = train_df.loc[val_mask, "target_up_down"].astype(int)
+            fold_model = _make_lgbm(params, random_state)
+            fold_model.fit(x_tr, y_tr)
+            fold_scores.append(accuracy_score(y_val, fold_model.predict(x_val)))
+        mean_score = float(np.mean(fold_scores))
+        trials.append({"params": params, "mean_val_accuracy": mean_score, "fold_scores": fold_scores})
+        if mean_score > best_score:
+            best_score = mean_score
+            best_params = params
+
+    x_train = build_feature_matrix(train_df)
+    x_test = build_feature_matrix(test_df)
+    y_train = train_df["target_up_down"].astype(int)
+    y_test = test_df["target_up_down"].astype(int)
+
+    final_model = _make_lgbm(best_params, random_state)
+    final_model.fit(x_train, y_train)
+    y_pred_model = final_model.predict(x_test)
+
+    y_pred_majority = majority_baseline(y_train, len(y_test))
+    y_pred_persistence = persistence_baseline(test_df)
+
+    return {
+        "model": final_model,
+        "model_type": "lightgbm",
+        "feature_names": FEATURE_NAMES,
+        "train_rows": len(train_df),
+        "test_rows": len(test_df),
+        "train_date_max": str(train_df["date"].max()),
+        "test_date_min": str(test_df["date"].min()),
+        "test_date_max": str(test_df["date"].max()),
+        "metrics_model": evaluate(y_test, y_pred_model),
+        "metrics_majority_baseline": evaluate(y_test, y_pred_majority),
+        "metrics_persistence_baseline": evaluate(y_test, y_pred_persistence),
+        "best_params": best_params,
+        "cv_best_val_accuracy": best_score,
+        "tuning_trials": trials,
+    }
+
+
 def save_model(result: dict) -> tuple[str, Path]:
     """Guarda el modelo entrenado en MODELS_DIR con un model_version único
     (tipo + timestamp). Devuelve (model_version, ruta).
@@ -269,27 +418,34 @@ def save_model(result: dict) -> tuple[str, Path]:
     modelo sin tener que reentrenar (~500k filas) cada vez que alguien
     abre una página. Los modelos guardados ANTES de este cambio no tienen
     estas claves — el código que las lea debe usar `.get()` con
-    valor por defecto, nunca asumir que existen."""
+    valor por defecto, nunca asumir que existen.
+
+    Si `result` viene de `tune_lightgbm()` (tiene `best_params`), también
+    se guardan `best_params`/`cv_best_val_accuracy` para dejar constancia
+    de con qué hiperparámetros se entrenó — NO se guarda `tuning_trials`
+    (puede ser largo y es solo de interés puntual al momento de tunear,
+    no algo que el dashboard necesite cargar en cada arranque)."""
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
     model_version = f"{result['model_type']}_{datetime.now():%Y%m%d%H%M%S}"
     path = MODELS_DIR / f"{model_version}.joblib"
-    joblib.dump(
-        {
-            "model": result["model"],
-            "feature_names": result["feature_names"],
-            "model_type": result["model_type"],
-            "train_rows": result["train_rows"],
-            "test_rows": result["test_rows"],
-            "train_date_max": result["train_date_max"],
-            "test_date_min": result["test_date_min"],
-            "test_date_max": result["test_date_max"],
-            "metrics_model": result["metrics_model"],
-            "metrics_majority_baseline": result["metrics_majority_baseline"],
-            "metrics_persistence_baseline": result["metrics_persistence_baseline"],
-            "trained_at": datetime.now().isoformat(),
-        },
-        path,
-    )
+    bundle = {
+        "model": result["model"],
+        "feature_names": result["feature_names"],
+        "model_type": result["model_type"],
+        "train_rows": result["train_rows"],
+        "test_rows": result["test_rows"],
+        "train_date_max": result["train_date_max"],
+        "test_date_min": result["test_date_min"],
+        "test_date_max": result["test_date_max"],
+        "metrics_model": result["metrics_model"],
+        "metrics_majority_baseline": result["metrics_majority_baseline"],
+        "metrics_persistence_baseline": result["metrics_persistence_baseline"],
+        "trained_at": datetime.now().isoformat(),
+    }
+    if "best_params" in result:
+        bundle["best_params"] = result["best_params"]
+        bundle["cv_best_val_accuracy"] = result.get("cv_best_val_accuracy")
+    joblib.dump(bundle, path)
     return model_version, path
 
 
@@ -323,11 +479,29 @@ def print_report(result: dict) -> None:
             file=sys.stderr,
         )
 
+    if "best_params" in result:
+        print(
+            f"[model] --- tuning: mejor accuracy media en validación walk-forward = "
+            f"{result['cv_best_val_accuracy']:.3f} ---",
+            file=sys.stderr,
+        )
+        print(f"[model]   hiperparámetros: {result['best_params']}", file=sys.stderr)
+
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--model", choices=["random_forest", "logistic"], default="random_forest")
+    parser.add_argument("--model", choices=["random_forest", "logistic", "lightgbm"], default="random_forest")
+    parser.add_argument(
+        "--tune", action="store_true",
+        help="solo válido con --model lightgbm: busca hiperparámetros con validación walk-forward "
+        "(tune_lightgbm) en vez de usar los valores por defecto.",
+    )
+    parser.add_argument("--tune-iterations", type=int, default=20, help="combinaciones a probar con --tune")
     args = parser.parse_args(argv)
+
+    if args.tune and args.model != "lightgbm":
+        print("[model] --tune solo está soportado con --model lightgbm por ahora.", file=sys.stderr)
+        return 1
 
     engine = dbmod.get_engine()
     df = read_gold_train(engine)
@@ -335,7 +509,10 @@ def main(argv: list[str] | None = None) -> int:
         print("[model] gold_train está vacío. Ejecuta antes gold.py.", file=sys.stderr)
         return 1
 
-    result = train_and_evaluate(df, model_type=args.model)
+    if args.tune:
+        result = tune_lightgbm(df, n_iter=args.tune_iterations)
+    else:
+        result = train_and_evaluate(df, model_type=args.model)
     print_report(result)
     model_version, path = save_model(result)
     print(f"[model] modelo guardado: {model_version} -> {path}", file=sys.stderr)

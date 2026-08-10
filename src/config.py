@@ -10,6 +10,7 @@ futuro sin buscar y reemplazar valores sueltos por el código.
 Diseño de referencia: ver CONTEXTO.md en la raíz del repo.
 """
 
+import datetime as dt
 import os
 from pathlib import Path
 
@@ -207,5 +208,26 @@ NEWS_TICKERS_PER_CALL = 1
 # borrar nada a mano.
 NEWS_BACKFILL_MONTHS = 6
 NEWS_BACKFILL_WINDOW_DAYS = 180
+
+# BUG REAL CORREGIDO (2026-08-08) — ver CONTEXTO.md "Bug de no-convergencia
+# del backfill". `date_windows()` (news.py) calculaba sus ventanas con
+# `end = dt.date.today()` por defecto: como "hoy" avanza un día cada vez
+# que se ejecuta el cron, TODAS las ventanas (no solo la más reciente) se
+# recalculaban con fechas distintas cada día — el `window_start` de ayer
+# nunca coincidía con el de hoy, así que `news_backfill_progress` (clave
+# compuesta batch_key + window_start) nunca reconocía nada como "ya
+# hecho": el backfill volvía a "208/208 pendientes" cada ejecución, sin
+# converger nunca, sin importar cuántos días se dejara corriendo. Esto
+# llevaba presente desde el diseño original de 24 meses/ventanas de 30
+# días (se veía como el contador de ventanas subiendo en vez de bajar
+# entre ejecuciones, ya observado en el log del 2026-08-06 y mal
+# atribuido entonces solo a confusión de cupo). Fix: las ventanas del
+# backfill se anclan a esta fecha FIJA, no a `dt.date.today()` — así
+# `window_start` es estable entre ejecuciones y el progreso si se
+# acumula. No se actualiza sola: es un ancla deliberada del backfill en
+# curso, no una fecha "viva". `run_daily_update()` no se ve afectado (no
+# usa `date_windows()`, calcula ayer/hoy directamente cada vez, donde sí
+# tiene sentido que sea relativo a "hoy").
+NEWS_BACKFILL_REFERENCE_DATE = dt.date(2026, 8, 8)
 
 NEWS_RAW_DIR = DATA_DIR / "raw" / "news"

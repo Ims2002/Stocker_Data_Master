@@ -63,6 +63,7 @@ import db as dbmod  # noqa: E402
 from config import (  # noqa: E402
     ALPHA_VANTAGE_API_KEY,
     NEWS_BACKFILL_MONTHS,
+    NEWS_BACKFILL_REFERENCE_DATE,
     NEWS_BACKFILL_WINDOW_DAYS,
     NEWS_DAILY_CALL_BUDGET,
     NEWS_RAW_DIR,
@@ -280,8 +281,14 @@ def pending_work_items(engine: Engine) -> list[tuple[int, dt.date, dt.date]]:
     crudo con `text()`) para que SQLAlchemy aplique el tipo `Date` al leer
     `window_start` — con SQL crudo, sqlite3 devuelve la fecha como string y
     la comparación con los `datetime.date` de `date_windows()` nunca
-    coincidiría."""
-    windows = date_windows(NEWS_BACKFILL_MONTHS, NEWS_BACKFILL_WINDOW_DAYS)
+    coincidiría.
+
+    `end=NEWS_BACKFILL_REFERENCE_DATE` (no el `dt.date.today()` por
+    defecto de `date_windows()`) es OBLIGATORIO aquí — ver el comentario
+    junto a esa constante en config.py: sin anclar `end`, las ventanas se
+    recalculan con fechas distintas cada día y el backfill nunca converge
+    (bug real corregido 2026-08-08)."""
+    windows = date_windows(NEWS_BACKFILL_MONTHS, NEWS_BACKFILL_WINDOW_DAYS, end=NEWS_BACKFILL_REFERENCE_DATE)
     batches = ticker_batches()
     batch_keys = [_batch_key(b) for b in batches]
 
@@ -327,7 +334,7 @@ def run_backfill(engine: Engine, max_calls: int) -> None:
         print("[news] backfill ya completo — no quedan ventanas pendientes.", file=sys.stderr)
         return
 
-    total_windows = len(date_windows(NEWS_BACKFILL_MONTHS, NEWS_BACKFILL_WINDOW_DAYS)) * len(batches)
+    total_windows = len(date_windows(NEWS_BACKFILL_MONTHS, NEWS_BACKFILL_WINDOW_DAYS, end=NEWS_BACKFILL_REFERENCE_DATE)) * len(batches)
     print(
         f"[news] {len(items)}/{total_windows} ventanas pendientes (lote de tickers x ventana de fechas). "
         f"Presupuesto de esta ejecución: {max_calls} llamadas.",

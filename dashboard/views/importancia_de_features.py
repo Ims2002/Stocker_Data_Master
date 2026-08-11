@@ -21,16 +21,6 @@ import data_access as da  # noqa: E402
 
 st.title("En qué se fija el modelo para decidir")
 
-st.markdown(
-    """
-El modelo no es magia ni "sabe" de bolsa: cada día mira 6 datos numéricos calculados a partir del
-historial de precios de cada acción, y con eso decide si cree que subirá o bajará mañana.
-
-Esta página muestra en cuáles de esos 6 datos se apoya más a la hora de decidir, y en cuáles menos —
-como una receta, donde unos ingredientes pesan más que otros en el resultado final.
-    """
-)
-
 
 @st.cache_resource
 def _model_bundle():
@@ -49,6 +39,24 @@ model_type = bundle.get("model_type", "desconocido")
 if fi is None:
     st.warning("Este modelo no permite calcular en qué se fija más o menos.")
     st.stop()
+
+# Nº de features calculado del modelo cargado (bundle["feature_names"] o
+# FEATURE_NAMES por defecto, ver data_access.feature_importances) — NUNCA
+# hardcodeado aquí: este número ha cambiado dos veces ya (6 -> 14 -> 16,
+# ver CONTEXTO.md "Ampliación de features" y "Preparación de noticias
+# como feature") y un texto fijo se queda desactualizado en silencio cada
+# vez que se añaden features nuevas.
+n_features = len(fi)
+st.markdown(
+    f"""
+El modelo no es magia ni "sabe" de bolsa: cada día mira {n_features} datos numéricos calculados a
+partir del historial de precios (y, si hay cobertura, noticias) de cada acción, y con eso decide si
+cree que subirá o bajará mañana.
+
+Esta página muestra en cuáles de esos {n_features} datos se apoya más a la hora de decidir, y en
+cuáles menos — como una receta, donde unos ingredientes pesan más que otros en el resultado final.
+    """
+)
 
 fig = px.bar(
     fi, x="importancia", y="etiqueta", orientation="h",
@@ -84,8 +92,8 @@ Modelo usado: **{"Random Forest" if model_type == "random_forest" else "Regresi�
   coeficiente de cada variable en esa fórmula — indica cuánto influye, pero no cómo se combina con las
   demás (a diferencia de Random Forest, no capta relaciones más complejas entre variables).
 
-Ninguna de las 6 variables usa el precio de la acción en bruto (20 dólares o 900 dólares) — todas están
-calculadas como porcentajes o comparaciones relativas, para que una acción cara y una barata sean
-comparables entre sí. Ver `CONTEXTO.md` y `model.build_feature_matrix` para el detalle completo.
+Ninguna de las {n_features} variables usa el precio de la acción en bruto (20 dólares o 900 dólares) —
+todas están calculadas como porcentajes o comparaciones relativas, para que una acción cara y una barata
+sean comparables entre sí. Ver `CONTEXTO.md` y `model.build_feature_matrix` para el detalle completo.
         """
     )

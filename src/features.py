@@ -33,7 +33,7 @@ import pandas as pd
 ROLLING_FEATURE_COLUMNS = [
     "return_1d", "ma_5", "ma_10", "ma_20", "volatility_10d",
     "return_5d", "return_20d", "rsi_14", "macd_line", "macd_signal",
-    "price_std_20", "volume_ma_10",
+    "price_std_20", "volume_ma_10", "news_sentiment_3d", "news_volume_3d",
 ]
 
 # Ventanas de los indicadores nuevos — valores estándar de la industria
@@ -45,6 +45,15 @@ _MACD_FAST, _MACD_SLOW, _MACD_SIGNAL = 12, 26, 9
 _MACD_WARMUP = _MACD_SLOW + _MACD_SIGNAL - 2  # 33 — ver comentario arriba
 _BOLLINGER_WINDOW = 20
 _VOLUME_MA_WINDOW = 10
+
+# Ventana del sentimiento de noticias — corta a propósito (3 sesiones, no
+# 10/20 como ma_10/ma_20): la relevancia de una noticia decae rápido, y
+# la profundidad histórica real disponible tampoco da para una ventana
+# larga (NEWS_BACKFILL_MONTHS=6, ver config.py). No es un valor tuneado
+# contra el dataset, es un punto de partida razonable — igual que
+# _RSI_WINDOW/_MACD_FAST/etc. arriba (ver CONTEXTO.md, "Preparación de
+# noticias como feature", 2026-08-08).
+_NEWS_SENTIMENT_WINDOW = 3
 
 
 def _compute_rsi(adj_close: pd.Series, window: int = _RSI_WINDOW) -> pd.Series:
@@ -162,3 +171,51 @@ def has_complete_features(df: pd.DataFrame) -> pd.Series:
     """Máscara booleana: True en las filas donde TODAS las features
     rolling ya están calculadas (no NaN por falta de histórico previo)."""
     return df[ROLLING_FEATURE_COLUMNS].notna().all(axis=1)
+
+
+def attach_news_features(
+    feat: pd.DataFrame, news: pd.DataFrame, window: int = _NEWS_SENTIMENT_WINDOW
+) -> pd.DataFrame:
+    """Añade `news_sentiment_3d`/`news_volume_3d` a `feat` (salida de
+    `compute_features()`, una fila por sesión de UN ticker, orden
+    ascendente por fecha).
+
+    `news` es el resultado de `news_sentiment_daily` (vista agregada
+    sobre `news_articles`, ver `db.py`) para ESE MISMO ticker: solo trae
+    fila para los días en los que hubo al menos un artículo — la mayoría
+    de sesiones no tendrán fila, sobre todo fuera de la ventana de
+    `NEWS_BACKFILL_MONTHS` (config.py) o en tickers que el backfill de
+    noticias todavía no ha cubierto (backfill en curso, ver CONTEXTO.md).
+    Debe traer como mínimo las columnas `date`, `avg_sentiment_score` y
+    `n_articles`; puede venir vacío (DataFrame sin filas) sin problema.
+
+    "Sin noticias ese día" se trata como sentimiento neutro (0) y volumen
+    cero, no como NaN — mismo criterio ya establecido para
+    `bb_pct_b`/`relative_volume` (CONTEXTO.md, "Ampliación de features"):
+    es un valor real e informativo ("no hubo cobertura"), no un dato
+    ausente que haya que enmascarar.
+
+    El suavizado a `window` sesiones usa `.rolling()` SIN `min_periods`,
+    igual que el resto de indicadores de este módulo (nunca una ventana
+    parcial) — como la serie diaria ya no tiene NaN tras el fillna(0),
+    esto solo deja en NaN las primeras `window - 1` filas de TODO el
+    histórico del ticker (calentamiento estándar, igual que ma_5/rsi_14),
+    no introduce huecos nuevos en mitad de la serie."""
+    out = feat.copy()
+
+    if news is None or news.empty:
+        daily_sentiment = pd.Series(0.0, index=out.index)
+        daily_volume = pd.Series(0.0, index=out.index)
+    else:
+        merged = feat[["date"]].merge(
+            news[["date", "avg_sentiment_score", "n_articles"]],
+            on="date",
+            how="left",
+        )
+        daily_sentiment = merged["avg_sentiment_score"].fillna(0.0)
+        daily_volume = merged["n_articles"].fillna(0.0)
+
+    out["news_sentiment_3d"] = daily_sentiment.rolling(window=window, min_periods=window).mean().to_numpy()
+    out["news_volume_3d"] = daily_volume.rolling(window=window, min_periods=window).sum().to_numpy()
+
+    return out

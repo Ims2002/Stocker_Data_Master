@@ -126,13 +126,25 @@ def build_feature_matrix(df: pd.DataFrame) -> pd.DataFrame:
     decida cuál de las dos pesa más (ver "Importancia de features" en el
     dashboard).
 
-    Sentimiento de noticias (`news_sentiment_daily`, ver `news.py`):
-    deliberadamente NO incluido todavía — a fecha de esta ampliación la
-    tabla `news_articles` seguía con 0 filas reales (el backfill vive del
-    cupo gratuito de 25 peticiones/día de Alpha Vantage y todavía no ha
-    producido datos), así que añadirlo ahora solo metería una columna
-    constante sin ninguna señal real. Pendiente explícito para cuando el
-    backfill tenga cobertura de verdad — ver CONTEXTO.md.
+    Sentimiento de noticias (2026-08-08, ver CONTEXTO.md "Preparación de
+    noticias como feature"): `news_sentiment_3d` (media de
+    `ticker_sentiment_score` suavizada a 3 sesiones, ya acotada en un
+    rango tipo [-1, 1], comparable entre tickers tal cual, igual que
+    `rsi_14`) y `news_volume_log` (log1p de `news_volume_3d`, el nº de
+    artículos sumado en las últimas 3 sesiones — mismo criterio que
+    `log_volume`: mitiga, no elimina del todo, la diferencia de escala
+    entre un ticker muy mediático y uno que apenas sale en prensa).
+    Ambas vienen ya en 0 (neutro/sin cobertura) para cualquier fecha o
+    ticker sin noticias, no en NaN (ver `features.attach_news_features`).
+
+    IMPORTANTE — no reentrenar todavía solo por esto: a fecha de esta
+    ampliación el backfill de noticias solo cubre ~25/208 tickers (en
+    marcha, ver CONTEXTO.md) — para la mayoría de filas de `gold_train`
+    estas dos columnas valen 0 sin más, así que entrenar ahora mismo no
+    mediría la señal real de esta feature, solo añadiría dimensionalidad
+    sin información. Están aquí para que el pipeline esté listo en
+    cuanto el backfill tenga cobertura suficiente, no como indicación de
+    que ya toca reentrenar.
     """
     x = pd.DataFrame(index=df.index)
     x["return_1d"] = df["return_1d"]
@@ -167,6 +179,8 @@ def build_feature_matrix(df: pd.DataFrame) -> pd.DataFrame:
         rel_volume = df["volume"] / df["volume_ma_10"] - 1
     x["relative_volume"] = rel_volume.where(df["volume_ma_10"] > 0, 0.0)
     x["day_of_week"] = df["day_of_week"]
+    x["news_sentiment_3d"] = df["news_sentiment_3d"]
+    x["news_volume_log"] = np.log1p(df["news_volume_3d"])
     return x
 
 
@@ -175,6 +189,7 @@ FEATURE_NAMES = [
     "close_to_ma5", "close_to_ma10", "close_to_ma20",
     "rsi_14", "macd_hist_norm", "bb_pct_b", "bb_width",
     "log_volume", "relative_volume", "day_of_week",
+    "news_sentiment_3d", "news_volume_log",
 ]
 
 

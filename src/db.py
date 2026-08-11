@@ -72,6 +72,13 @@ def _gold_feature_columns() -> list[Column]:
     comparables entre tickers, nunca aquí). day_of_week no depende de
     ventana histórica (se calcula directo de `date`), por eso es la única
     de este grupo que no puede quedar NULL.
+
+    Preparación de noticias como feature (2026-08-08, ver CONTEXTO.md):
+    news_sentiment_3d/news_volume_3d, calculados en
+    `features.attach_news_features()` a partir de la vista
+    `news_sentiment_daily`. Nullable por el mismo motivo que el resto de
+    features "rolling": las primeras filas de cada ticker quedan en NaN
+    por calentamiento de la ventana (nunca una ventana parcial).
     """
     return [
         Column("open", Float, nullable=False),
@@ -93,6 +100,8 @@ def _gold_feature_columns() -> list[Column]:
         Column("price_std_20", Float, nullable=True),
         Column("volume_ma_10", Float, nullable=True),
         Column("day_of_week", Integer, nullable=False),
+        Column("news_sentiment_3d", Float, nullable=True),
+        Column("news_volume_3d", Float, nullable=True),
     ]
 
 
@@ -235,22 +244,30 @@ news_backfill_progress = Table(
 
 
 def _migrate_gold_tables(engine: Engine) -> None:
-    """Si `gold_train`/`gold_inference` existen con el esquema antiguo (sin
-    las columnas de la ampliación de features de 2026-08-06 — rsi_14,
-    macd_line, etc., ver `_gold_feature_columns()`), se eliminan y se
-    recrean vacías. Seguro de hacer: a diferencia de `news_articles` (datos
-    caros de volver a pedir a una API con cuota limitada), gold_train/
-    gold_inference son 100% derivadas de `daily_prices` y `gold.py` las
-    recalcula por completo (delete+insert) en cada ejecución — no hay nada
-    que perder que no se regenere solo con `python gold.py`."""
+    """Si `gold_train`/`gold_inference` existen con un esquema antiguo
+    (sin las columnas de la ampliación de features de 2026-08-06 —
+    rsi_14, macd_line, etc. — o sin las de noticias de 2026-08-08 —
+    news_sentiment_3d, news_volume_3d — ver `_gold_feature_columns()`),
+    se eliminan y se recrean vacías. Seguro de hacer: a diferencia de
+    `news_articles` (datos caros de volver a pedir a una API con cuota
+    limitada), gold_train/gold_inference son 100% derivadas de
+    `daily_prices` (+ `news_sentiment_daily`, ella misma derivada de
+    `news_articles`) y `gold.py` las recalcula por completo
+    (delete+insert) en cada ejecución — no hay nada que perder que no se
+    regenere solo con `python gold.py`.
+
+    El marcador es `news_sentiment_3d` (la columna más reciente): si
+    falta, cualquier esquema anterior a este (con o sin rsi_14) también
+    se recrea, sin necesidad de comprobar cada columna añadida por
+    separado."""
     with engine.begin() as conn:
         for table_name in ("gold_train", "gold_inference"):
             cols = [row[1] for row in conn.execute(text(f"PRAGMA table_info({table_name})"))]
-            if cols and "rsi_14" not in cols:
+            if cols and "news_sentiment_3d" not in cols:
                 print(
                     f"[db] {table_name} con esquema antiguo (sin las features nuevas) — se recrea "
-                    "vacía (ver CONTEXTO.md, 'Ampliación de features', 2026-08-06). "
-                    "Ejecuta `python gold.py` después para repoblarla.",
+                    "vacía (ver CONTEXTO.md, 'Ampliación de features' 2026-08-06 / 'Preparación de "
+                    "noticias como feature' 2026-08-08). Ejecuta `python gold.py` después para repoblarla.",
                     file=sys.stderr,
                 )
                 conn.execute(text(f"DROP TABLE {table_name}"))

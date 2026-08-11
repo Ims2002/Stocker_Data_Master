@@ -27,22 +27,25 @@ import sys
 from pathlib import Path
 
 import pandas as pd
+from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import db as dbmod  # noqa: E402
 from config import MIN_HISTORY_ROWS_FOR_GOLD, TICKERS  # noqa: E402
-from features import ROLLING_FEATURE_COLUMNS, compute_features  # noqa: E402
+from features import ROLLING_FEATURE_COLUMNS, attach_news_features, compute_features  # noqa: E402
 
 # Columnas de features que va a llevar gold_train/gold_inference (crudas +
 # derivadas por features.py) — no incluye ticker/date, que se añaden
 # aparte. DEBE mantenerse en el mismo orden que `db._gold_feature_columns()`
-# (ver CONTEXTO.md, "Ampliación de features", 2026-08-06).
+# (ver CONTEXTO.md, "Ampliación de features", 2026-08-06 y "Preparación de
+# noticias como feature", 2026-08-08).
 _GOLD_FEATURE_COLUMNS = [
     "open", "high", "low", "close", "adj_close", "volume",
     "return_1d", "ma_5", "ma_10", "ma_20", "volatility_10d",
     "return_5d", "return_20d", "rsi_14", "macd_line", "macd_signal",
     "price_std_20", "volume_ma_10", "day_of_week",
+    "news_sentiment_3d", "news_volume_3d",
 ]
 
 
@@ -63,10 +66,43 @@ def read_daily_prices(ticker: str, engine: Engine) -> pd.DataFrame:
     return pd.DataFrame(rows, columns=columns) if rows else pd.DataFrame()
 
 
-def build_gold_frames(raw: pd.DataFrame, ticker: str) -> tuple[pd.DataFrame, pd.DataFrame]:
+def read_news_sentiment(ticker: str, engine: Engine) -> pd.DataFrame:
+    """Lee `news_sentiment_daily` (VISTA, ver `db.py`) para un ticker.
+
+    Es una vista creada con SQL crudo (no hay `Table()` de SQLAlchemy
+    para ella, a diferencia de `daily_prices`), así que se consulta con
+    `text()` — y por eso `date` vuelve como texto, no como
+    `datetime.date` (mismo caveat ya documentado en
+    `news.pending_work_items()`). Se convierte explícitamente con pandas
+    antes de devolver, para que el tipo coincida con `daily_prices.date`
+    al hacer el merge en `features.attach_news_features()`.
+
+    Devuelve un DataFrame vacío si el ticker todavía no tiene ninguna
+    fila en `news_articles` — normal mientras el backfill de noticias
+    sigue en marcha (ver CONTEXTO.md, backfill de 6 meses en curso)."""
+    query = text(
+        "SELECT date, avg_sentiment_score, n_articles "
+        "FROM news_sentiment_daily WHERE ticker = :ticker ORDER BY date"
+    )
+    with engine.begin() as conn:
+        rows = conn.execute(query, {"ticker": ticker}).fetchall()
+    df = pd.DataFrame(rows, columns=["date", "avg_sentiment_score", "n_articles"])
+    if not df.empty:
+        df["date"] = pd.to_datetime(df["date"]).dt.date
+    return df
+
+
+def build_gold_frames(
+    raw: pd.DataFrame, ticker: str, news: pd.DataFrame | None = None
+) -> tuple[pd.DataFrame, pd.DataFrame]:
     """A partir del histórico crudo (daily_prices) de un ticker, calcula
     features y target, y separa en (train_df, inference_df) — ver
     docstring del módulo.
+
+    `news` (opcional, ver `read_news_sentiment()`): si no se pasa o el
+    ticker no tiene ninguna fila todavía, `attach_news_features()` deja
+    `news_sentiment_3d`/`news_volume_3d` en su valor neutro (0, tras el
+    calentamiento) en vez de fallar.
 
     Puede devolver train_df e inference_df vacíos si no hay histórico
     suficiente (ver MIN_HISTORY_ROWS_FOR_GOLD).
@@ -75,6 +111,7 @@ def build_gold_frames(raw: pd.DataFrame, ticker: str) -> tuple[pd.DataFrame, pd.
         return pd.DataFrame(), pd.DataFrame()
 
     feat = compute_features(raw)
+    feat = attach_news_features(feat, news)
 
     # Target: shift(-1) sobre Close (no adj_close), tal como fija CONTEXTO.md.
     feat["close_next_day"] = feat["close"].shift(-1)
@@ -124,7 +161,8 @@ def build_gold_for_ticker(ticker: str, engine: Engine | None = None) -> tuple[in
             f"(mínimo {MIN_HISTORY_ROWS_FOR_GOLD})."
         )
 
-    train_df, inference_df = build_gold_frames(raw, ticker)
+    news = read_news_sentiment(ticker, engine)
+    train_df, inference_df = build_gold_frames(raw, ticker, news)
     upsert_gold_for_ticker(ticker, train_df, inference_df, engine)
     return len(train_df), len(inference_df)
 

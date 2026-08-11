@@ -51,6 +51,8 @@ FEATURE_LABELS: dict[str, str] = {
     "log_volume": "Cuánto se ha negociado",
     "relative_volume": "Si hoy se ha negociado más o menos de lo normal",
     "day_of_week": "Qué día de la semana es",
+    "news_sentiment_3d": "Tono de las noticias recientes",
+    "news_volume_log": "Cuánto se ha hablado de la acción en prensa",
 }
 
 FEATURE_EXPLANATIONS: dict[str, str] = {
@@ -86,6 +88,14 @@ FEATURE_EXPLANATIONS: dict[str, str] = {
         "volumen en bruto para comparar una acción muy negociada con una que lo es menos."
     ),
     "day_of_week": "Lunes, martes... — por si hay patrones que se repiten según el día de la semana.",
+    "news_sentiment_3d": (
+        "Tono medio de las noticias publicadas sobre la acción en los últimos 3 días de mercado: positivo, "
+        "negativo o neutro. Vale 0 si no hay noticias recientes o cobertura todavía."
+    ),
+    "news_volume_log": (
+        "Cuánto se ha escrito sobre la acción en prensa en los últimos 3 días — no el tono, solo la "
+        "cantidad. Vale 0 si no hay cobertura."
+    ),
 }
 
 

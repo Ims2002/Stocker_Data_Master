@@ -12,18 +12,25 @@ reintentará la próxima vez que se ejecute).
 
 Cálculo del resultado, EXACTAMENTE igual que `gold.py` (nunca
 recalculado con una fórmula distinta a mano):
-    target_up_down = 1 si close(date_predicha) > close(sesión anterior)
+    target_up_down = 1 si close(date_predicha) > close(sesión de origen)
 
-"Sesión anterior" se toma como la fila inmediatamente anterior en el
-histórico de `daily_prices` de ESE ticker (mismo criterio que
-`feat["close"].shift(-1)` en gold.py: la fila anterior en la serie
-ordenada por fecha, no "el día natural de antes"). En operación normal,
-esa fila anterior es justo la fecha que `predict.py` usó como "hoy" al
-generar la predicción (`date_predicha = next_trading_day(gold_inference.
-date)`), así que el resultado coincide con lo que `gold.py` habría
-calculado si esa fecha hubiera sido parte del histórico de entrenamiento.
+"Sesión de origen" se toma como la fila que está `horizon` sesiones ANTES
+de `date_predicha` en el histórico de `daily_prices` de ESE ticker (mismo
+criterio que `feat["close"].shift(-horizon)` en gold.py: N filas antes en
+la serie ordenada por fecha, no "N días naturales antes"). `horizon` se
+deduce del propio `model_version` (`predict.horizon_from_model_version`,
+2026-08-13, ver CONTEXTO.md "Horizontes de predicción: semana y mes") —
+para horizonte 1 (el único que existía antes de esa fecha), la sesión de
+origen es justo la fila inmediatamente anterior, que es la fecha que
+`predict.py` usó como "hoy" al generar la predicción
+(`date_predicha = nth_trading_day(gold_inference.date, horizon)`), así
+que el resultado coincide con lo que `gold.py` habría calculado si esa
+fecha hubiera sido parte del histórico de entrenamiento. Para horizontes
+más largos generaliza el mismo criterio: compara contra la sesión en la
+que se hizo realmente la predicción, no contra la sesión inmediatamente
+anterior a `date_predicha`.
 
-Empates (`close(date_predicha) == close(sesión anterior)`) cuentan como
+Empates (`close(date_predicha) == close(sesión de origen)`) cuentan como
 "baja/igual" (target_up_down=0), igual que en gold.py.
 
 Uso:
@@ -47,6 +54,7 @@ from sqlalchemy.engine import Engine
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import db as dbmod  # noqa: E402
+from predict import horizon_from_model_version  # noqa: E402
 
 
 def read_pending_predictions(engine: Engine) -> pd.DataFrame:
@@ -101,12 +109,14 @@ def resolve_predictions(pending: pd.DataFrame, closes: pd.DataFrame) -> pd.DataF
             date_predicha = row["date_predicha"]
             if date_predicha not in series.index:
                 continue  # el cierre de ese día todavía no está en daily_prices
+            horizon = horizon_from_model_version(row["model_version"])
             pos = series.index.get_loc(date_predicha)
-            if pos == 0:
-                continue  # no hay ninguna sesión anterior registrada para este ticker
+            origin_pos = pos - horizon
+            if origin_pos < 0:
+                continue  # no hay suficiente histórico anterior para este horizonte/ticker
             close_today = series.iloc[pos]
-            close_prev = series.iloc[pos - 1]
-            actual = int(close_today > close_prev)
+            close_origin = series.iloc[origin_pos]
+            actual = int(close_today > close_origin)
             resolved_rows.append(
                 {
                     "ticker": ticker,

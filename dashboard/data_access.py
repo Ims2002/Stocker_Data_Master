@@ -20,7 +20,7 @@ from pathlib import Path
 
 import joblib
 import pandas as pd
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.engine import Engine
 
 _SRC_DIR = Path(__file__).resolve().parent.parent / "src"
@@ -28,6 +28,7 @@ sys.path.insert(0, str(_SRC_DIR))
 
 import db as dbmod  # noqa: E402
 import predict as predictmod  # noqa: E402
+from config import DEFAULT_PREDICTION_HORIZON, PREDICTION_HORIZONS  # noqa: E402
 from model import FEATURE_NAMES, build_feature_matrix  # noqa: E402
 
 # Traducciones de las features técnicas a lenguaje llano para la UI (ver
@@ -168,26 +169,39 @@ def get_gold_train_for_ticker(engine: Engine, ticker: str, months: int = 12) -> 
     return df[df["date"] >= cutoff].reset_index(drop=True)
 
 
-def get_latest_prediction(engine: Engine, ticker: str) -> dict | None:
-    """Predicción más reciente (por predicted_at) para `ticker`, de
-    cualquier model_version — normalmente solo hay uno, pero si se
-    reentrena el modelo, nos quedamos con la más nueva."""
+def get_latest_prediction(engine: Engine, ticker: str, horizon: int = DEFAULT_PREDICTION_HORIZON) -> dict | None:
+    """Predicción más reciente (por predicted_at) para `ticker` en un
+    horizonte concreto (2026-08-13, ver CONTEXTO.md "Horizontes de
+    predicción: semana y mes") — antes de esa fecha solo existía
+    horizonte 1 y esta función no filtraba por él. El horizonte no es una
+    columna de `predictions` (para no migrar el esquema): se deduce del
+    propio `model_version` con `predict.horizon_from_model_version`, igual
+    que en `track_predictions.py`. Se filtra en Python (no en SQL) porque
+    es sobre pocas filas por ticker, nunca sobre toda la tabla."""
     with engine.begin() as conn:
-        row = conn.execute(
+        rows = conn.execute(
             select(dbmod.predictions)
             .where(dbmod.predictions.c.ticker == ticker)
             .order_by(dbmod.predictions.c.predicted_at.desc())
-            .limit(1)
-        ).first()
-    return dict(row._mapping) if row is not None else None
+        ).fetchall()
+    for row in rows:
+        record = dict(row._mapping)
+        if predictmod.horizon_from_model_version(record["model_version"]) == horizon:
+            return record
+    return None
 
 
-def load_latest_model() -> dict:
-    """Carga el .joblib del modelo más reciente en MODELS_DIR. Devuelve el
-    bundle completo (ver model.save_model) — puede no tener las claves de
-    métricas si el modelo se entrenó antes de que model.py empezara a
-    guardarlas (usar .get() con valor por defecto, nunca indexar directo)."""
-    path = predictmod.latest_model_path()
+def load_latest_model(horizon: int = DEFAULT_PREDICTION_HORIZON) -> dict:
+    """Carga el .joblib del modelo más reciente de un horizonte concreto
+    en MODELS_DIR (2026-08-13, ver CONTEXTO.md "Horizontes de predicción:
+    semana y mes" — antes de esa fecha solo existía horizonte 1).
+    Devuelve el bundle completo (ver model.save_model) — puede no tener
+    las claves de métricas si el modelo se entrenó antes de que model.py
+    empezara a guardarlas (usar .get() con valor por defecto, nunca
+    indexar directo). Lanza FileNotFoundError si ese horizonte concreto
+    todavía no tiene ningún modelo entrenado (normal para 5/20 hasta que
+    alguien ejecute `model.py --horizon 5/20`)."""
+    path = predictmod.latest_model_path(horizon=horizon)
     bundle = joblib.load(path)
     bundle["_model_version"] = path.stem
     return bundle
@@ -200,6 +214,222 @@ def predict_for_gold_rows(bundle: dict, gold_df: pd.DataFrame) -> pd.Series:
     model.py para no duplicar la lógica de construcción de features."""
     x = build_feature_matrix(gold_df)
     return pd.Series(bundle["model"].predict(x), index=gold_df.index)
+
+
+def get_resolved_predictions(engine: Engine) -> pd.DataFrame:
+    """Predicciones reales ya resueltas (`actual_target_up_down IS NOT
+    NULL`, ver `src/track_predictions.py`) — el seguimiento real en
+    producción, no backtest. Nunca se agrega sin `model_version`: mezclar
+    versiones distintas en el mismo cálculo de acierto es engañoso (ver
+    CONTEXTO.md, "Seguimiento real de predicciones: primer análisis",
+    2026-08-13 — un modelo obsoleto sobre un día de mercado atípico
+    hundió el agregado sin que hubiera ningún problema real detrás)."""
+    with engine.begin() as conn:
+        result = conn.execute(
+            select(dbmod.predictions)
+            .where(dbmod.predictions.c.actual_target_up_down.is_not(None))
+            .order_by(dbmod.predictions.c.date_predicha)
+        )
+        rows = result.fetchall()
+        columns = result.keys()
+    df = pd.DataFrame(rows, columns=columns)
+    if df.empty:
+        return df
+    df["date_predicha"] = pd.to_datetime(df["date_predicha"])
+    df["acierto"] = df["predicted_target_up_down"] == df["actual_target_up_down"]
+    return df
+
+
+# --- Noticias y sentimiento (2026-08-13, ver CONTEXTO.md "Cuadros de mando
+# de noticias y sentimiento") -------------------------------------------
+
+SENTIMENT_LABEL_ORDER = ["Bearish", "Somewhat-Bearish", "Neutral", "Somewhat-Bullish", "Bullish"]
+SENTIMENT_LABEL_ES: dict[str, str] = {
+    "Bearish": "Muy negativo",
+    "Somewhat-Bearish": "Algo negativo",
+    "Neutral": "Neutro",
+    "Somewhat-Bullish": "Algo positivo",
+    "Bullish": "Muy positivo",
+}
+
+
+def news_coverage_status(engine: Engine) -> dict:
+    """Cuántos tickers tienen ya al menos un artículo, sobre el total de
+    `config.TICKERS` — el backfill de noticias (`src/news.py`) sigue en
+    marcha, así que esto cambia día a día (ver CONTEXTO.md)."""
+    with engine.begin() as conn:
+        total_tickers = len(conn.execute(select(dbmod.stocks.c.ticker)).fetchall())
+        covered = conn.execute(text("SELECT COUNT(DISTINCT ticker) FROM news_articles")).scalar()
+        total_articles = conn.execute(text("SELECT COUNT(*) FROM news_articles")).scalar()
+    return {"tickers_cubiertos": covered or 0, "tickers_totales": total_tickers, "articulos_totales": total_articles or 0}
+
+
+def get_daily_sentiment_for_ticker(engine: Engine, ticker: str, months: int = 12) -> pd.DataFrame:
+    """Serie diaria (`date`, `avg_sentiment_score`, `n_articles`) de la
+    vista `news_sentiment_daily` para un ticker — solo trae fila para los
+    días con al menos un artículo (ver `db.py`). Vía `text()` porque es
+    una vista sin `Table()` de SQLAlchemy, igual que
+    `gold.read_news_sentiment()`."""
+    query = text(
+        "SELECT date, avg_sentiment_score, avg_relevance_score, n_articles "
+        "FROM news_sentiment_daily WHERE ticker = :ticker ORDER BY date"
+    )
+    with engine.begin() as conn:
+        rows = conn.execute(query, {"ticker": ticker}).fetchall()
+    df = pd.DataFrame(rows, columns=["date", "avg_sentiment_score", "avg_relevance_score", "n_articles"])
+    if df.empty:
+        return df
+    df["date"] = pd.to_datetime(df["date"])
+    cutoff = df["date"].max() - pd.DateOffset(months=months)
+    return df[df["date"] >= cutoff].reset_index(drop=True)
+
+
+def get_recent_articles(engine: Engine, ticker: str, limit: int = 30, min_relevance: float = 0.0) -> pd.DataFrame:
+    """Últimos `limit` artículos de un ticker (más reciente primero), con
+    título, fuente, fecha, sentimiento y relevancia — para el listado de
+    titulares de la página por acción.
+
+    `min_relevance` (0-1, ver CONTEXTO.md "Titulares filtrados por
+    relevancia"): Alpha Vantage etiqueta con el ticker cualquier artículo
+    que lo MENCIONE, aunque el artículo sea en realidad sobre otra
+    empresa (ej. "F5 lanza una suite con NVIDIA" aparece bajo NVDA con
+    relevancia baja). Por defecto (0.0) no filtra nada — el llamador
+    decide el umbral."""
+    with engine.begin() as conn:
+        result = conn.execute(
+            select(dbmod.news_articles)
+            .where(dbmod.news_articles.c.ticker == ticker)
+            .where(dbmod.news_articles.c.relevance_score >= min_relevance)
+            .order_by(dbmod.news_articles.c.date.desc(), dbmod.news_articles.c.time_published.desc())
+            .limit(limit)
+        )
+        rows = result.fetchall()
+        columns = result.keys()
+    return pd.DataFrame(rows, columns=columns)
+
+
+def get_market_sentiment_daily(engine: Engine, months: int = 6) -> pd.DataFrame:
+    """Sentimiento medio del MERCADO (todos los tickers a la vez) por
+    día: media de `avg_sentiment_score` ponderada por nº de artículos de
+    cada ticker ese día (no una media simple de medias, para que un
+    ticker con 50 artículos pese más que uno con 1) + volumen total de
+    artículos. Base para el gráfico de tendencia general."""
+    query = text(
+        """
+        SELECT date, SUM(avg_sentiment_score * n_articles) AS peso_sentimiento,
+               SUM(n_articles) AS n_articles
+        FROM news_sentiment_daily
+        GROUP BY date
+        ORDER BY date
+        """
+    )
+    with engine.begin() as conn:
+        rows = conn.execute(query).fetchall()
+    df = pd.DataFrame(rows, columns=["date", "peso_sentimiento", "n_articles"])
+    if df.empty:
+        return df
+    df["date"] = pd.to_datetime(df["date"])
+    df["sentimiento_medio"] = df["peso_sentimiento"] / df["n_articles"]
+    cutoff = df["date"].max() - pd.DateOffset(months=months)
+    return df.loc[df["date"] >= cutoff, ["date", "sentimiento_medio", "n_articles"]].reset_index(drop=True)
+
+
+def get_ticker_sentiment_ranking(engine: Engine, days: int = 7, min_articles: int = 3) -> pd.DataFrame:
+    """Sentimiento medio por ticker en los últimos `days` días de
+    cobertura real (no días de calendario — si un ticker no tiene
+    artículos hoy, cuentan sus últimos días CON artículos), con nombre y
+    sector (`stocks`). Filtra tickers con menos de `min_articles`
+    artículos en la ventana para que uno o dos artículos sueltos no
+    dominen el ranking de "más positivo/negativo" — ver CONTEXTO.md."""
+    query = text(
+        """
+        SELECT ticker, date, avg_sentiment_score, n_articles
+        FROM news_sentiment_daily
+        """
+    )
+    with engine.begin() as conn:
+        rows = conn.execute(query).fetchall()
+        stocks_rows = conn.execute(select(dbmod.stocks)).fetchall()
+    df = pd.DataFrame(rows, columns=["ticker", "date", "avg_sentiment_score", "n_articles"])
+    if df.empty:
+        return df
+    df["date"] = pd.to_datetime(df["date"])
+
+    # Para cada ticker, se queda con sus últimos `days` días CON cobertura
+    # (no con los últimos `days` días de calendario) — así un ticker que
+    # lleva una semana sin noticias no desaparece del ranking solo por
+    # mala suerte de timing, sigue reflejando su sentimiento reciente real.
+    # `groupby(...).tail(n)` conserva todas las columnas (incluida
+    # `ticker`) sin necesitar `apply`, evita el lío de `include_groups`
+    # que solo existe desde pandas 2.2.
+    recent = df.sort_values("date").groupby("ticker", as_index=False).tail(days)
+
+    agg = recent.groupby("ticker").agg(
+        sentimiento=("avg_sentiment_score", "mean"),
+        articulos=("n_articles", "sum"),
+        ultima_fecha=("date", "max"),
+    ).reset_index()
+    agg = agg[agg["articulos"] >= min_articles]
+
+    stocks_df = pd.DataFrame(stocks_rows, columns=["ticker", "nombre", "sector", "pais"])
+    agg = agg.merge(stocks_df, on="ticker", how="left")
+    return agg.sort_values("sentimiento", ascending=False).reset_index(drop=True)
+
+
+def get_sector_sentiment(engine: Engine, days: int = 30) -> pd.DataFrame:
+    """Sentimiento medio por sector, ponderado por nº de artículos,
+    usando los últimos `days` días de calendario (a diferencia del
+    ranking por ticker, aquí sí se usan días de calendario porque se
+    agrega sobre muchos tickers a la vez — la falta de noticias de un
+    ticker concreto un día se diluye en el sector)."""
+    query = text(
+        """
+        SELECT nsd.ticker, nsd.date, nsd.avg_sentiment_score, nsd.n_articles, s.sector
+        FROM news_sentiment_daily nsd
+        JOIN stocks s ON s.ticker = nsd.ticker
+        WHERE s.sector IS NOT NULL
+        """
+    )
+    with engine.begin() as conn:
+        rows = conn.execute(query).fetchall()
+    df = pd.DataFrame(rows, columns=["ticker", "date", "avg_sentiment_score", "n_articles", "sector"])
+    if df.empty:
+        return df
+    df["date"] = pd.to_datetime(df["date"])
+    cutoff = df["date"].max() - pd.DateOffset(days=days)
+    df = df[df["date"] >= cutoff]
+    if df.empty:
+        return df
+    df["peso"] = df["avg_sentiment_score"] * df["n_articles"]
+    agg = df.groupby("sector").agg(peso=("peso", "sum"), n_articles=("n_articles", "sum")).reset_index()
+    agg["sentimiento"] = agg["peso"] / agg["n_articles"]
+    return agg.sort_values("sentimiento", ascending=False)[["sector", "sentimiento", "n_articles"]].reset_index(drop=True)
+
+
+def get_latest_predictions_summary(engine: Engine) -> dict | None:
+    """Resumen de las predicciones más recientes (la última `date_predicha`
+    guardada, de cualquier `model_version`): cuántas dicen "sube" vs.
+    "baja" y la probabilidad media — para un vistazo agregado de "qué
+    dice el modelo hoy" sin tener que elegir un ticker. Devuelve None si
+    `predictions` está vacía (pipeline no ejecutado todavía)."""
+    with engine.begin() as conn:
+        max_date = conn.execute(select(dbmod.predictions.c.date_predicha).order_by(
+            dbmod.predictions.c.date_predicha.desc()
+        ).limit(1)).scalar()
+        if max_date is None:
+            return None
+        rows = conn.execute(
+            select(dbmod.predictions).where(dbmod.predictions.c.date_predicha == max_date)
+        ).fetchall()
+    df = pd.DataFrame(rows, columns=["ticker", "date_predicha", "model_version", "predicted_target_up_down",
+                                      "predicted_probability", "predicted_at", "actual_target_up_down"])
+    return {
+        "date_predicha": max_date,
+        "n_total": len(df),
+        "n_up": int((df["predicted_target_up_down"] == 1).sum()),
+        "n_down": int((df["predicted_target_up_down"] == 0).sum()),
+        "avg_probability": float(df["predicted_probability"].mean()),
+    }
 
 
 def feature_importances(bundle: dict) -> pd.DataFrame | None:

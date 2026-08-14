@@ -25,9 +25,17 @@ bate a ambos baselines de forma consistente en el test temporal — si no,
 es un resultado válido que se reporta tal cual (ver CONTEXTO.md,
 Honestidad de resultado), no se oculta ni maquilla.
 
+Horizontes (2026-08-13, ver CONTEXTO.md "Horizontes de predicción: semana
+y mes"): además del horizonte a 1 sesión (día siguiente, por defecto),
+gold_train ya trae targets a 5 y 20 sesiones (~semana/mes de mercado) —
+`--horizon` elige cuál entrenar. Cada horizonte se guarda como un modelo
+independiente (`model_version` con `_hN_`), así que puede haber un modelo
+de cada horizonte conviviendo a la vez en MODELS_DIR.
+
 Uso:
-    python model.py                      # entrena random_forest (por defecto)
-    python model.py --model logistic     # o logistic_regression
+    python model.py                      # horizonte día, random_forest (por defecto)
+    python model.py --horizon 5          # horizonte semana
+    python model.py --horizon 20 --model logistic
 """
 
 from __future__ import annotations
@@ -47,7 +55,8 @@ from sqlalchemy.engine import Engine
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import db as dbmod  # noqa: E402
-from config import MODELS_DIR, TEST_PERIOD_MONTHS  # noqa: E402
+from config import DEFAULT_PREDICTION_HORIZON, MODELS_DIR, PREDICTION_HORIZONS, TEST_PERIOD_MONTHS  # noqa: E402
+from gold import HORIZON_COLUMNS  # noqa: E402
 
 def read_gold_train(engine: Engine) -> pd.DataFrame:
     """Usa `result.keys()` (no una lista de columnas a mano) para los
@@ -248,22 +257,39 @@ def _build_model(model_type: str):
     raise ValueError(f"model_type desconocido: {model_type!r}")
 
 
-def train_and_evaluate(df: pd.DataFrame, model_type: str = "random_forest") -> dict:
+def train_and_evaluate(
+    df: pd.DataFrame, model_type: str = "random_forest", horizon: int = DEFAULT_PREDICTION_HORIZON
+) -> dict:
     """Entrena el modelo con split temporal y devuelve un dict con el
     modelo entrenado, las métricas del modelo y de ambos baselines sobre
-    el mismo conjunto de test, y metadatos del split."""
+    el mismo conjunto de test, y metadatos del split.
+
+    `horizon` (2026-08-13, ver CONTEXTO.md "Horizontes de predicción:
+    semana y mes"): sesiones de mercado vista (1/5/20 = día/semana/mes,
+    ver `config.PREDICTION_HORIZONS`). Selecciona qué columna de target de
+    `gold_train` usar (`gold.HORIZON_COLUMNS`) y descarta antes del split
+    las filas sin ese target calculado — las últimas N-1 sesiones de cada
+    ticker, que sí están en `gold_train` (con el target a 1 sesión
+    relleno) pero no tienen suficiente futuro para el horizonte largo (ver
+    `gold.build_gold_frames`). Las features son las mismas para todos los
+    horizontes; solo cambia qué se le pide adivinar al modelo."""
+    if horizon not in HORIZON_COLUMNS:
+        raise ValueError(f"horizon desconocido: {horizon!r} (válidos: {sorted(HORIZON_COLUMNS)})")
+    target_col = HORIZON_COLUMNS[horizon][1]
+    df = df[df[target_col].notna()].copy()
+
     train_df, test_df = temporal_split(df)
     if train_df.empty or test_df.empty:
         raise ValueError(
             "Split temporal vacío (train o test): ¿hay suficiente histórico "
-            "en gold_train para separar los últimos "
+            f"en gold_train (horizonte={horizon}) para separar los últimos "
             f"{TEST_PERIOD_MONTHS} meses?"
         )
 
     x_train = build_feature_matrix(train_df)
     x_test = build_feature_matrix(test_df)
-    y_train = train_df["target_up_down"].astype(int)
-    y_test = test_df["target_up_down"].astype(int)
+    y_train = train_df[target_col].astype(int)
+    y_test = test_df[target_col].astype(int)
 
     model = _build_model(model_type)
     model.fit(x_train, y_train)
@@ -275,6 +301,7 @@ def train_and_evaluate(df: pd.DataFrame, model_type: str = "random_forest") -> d
     return {
         "model": model,
         "model_type": model_type,
+        "horizon": horizon,
         "feature_names": FEATURE_NAMES,
         "train_rows": len(train_df),
         "test_rows": len(test_df),
@@ -349,7 +376,10 @@ def _make_lgbm(params: dict, random_state: int):
     )
 
 
-def tune_lightgbm(df: pd.DataFrame, n_iter: int = 20, n_splits: int = 3, random_state: int = 42) -> dict:
+def tune_lightgbm(
+    df: pd.DataFrame, n_iter: int = 20, n_splits: int = 3, random_state: int = 42,
+    horizon: int = DEFAULT_PREDICTION_HORIZON,
+) -> dict:
     """Búsqueda aleatoria de hiperparámetros para LightGBM con validación
     cronológica walk-forward (`_time_series_folds`, nunca k-fold
     aleatorio). Evalúa `n_iter` combinaciones sobre el TRAIN oficial (el
@@ -359,15 +389,25 @@ def tune_lightgbm(df: pd.DataFrame, n_iter: int = 20, n_splits: int = 3, random_
     modelos — comparación justa: el test real no se toca ni una sola vez
     durante la búsqueda de hiperparámetros, solo al final.
 
+    `horizon`: mismo criterio que en `train_and_evaluate()` — selecciona
+    la columna de target de `gold_train` y descarta antes de nada las
+    filas sin ese target calculado (ver CONTEXTO.md, "Horizontes de
+    predicción: semana y mes").
+
     Devuelve el mismo formato que `train_and_evaluate()` (compatible con
     `save_model`/`print_report`), más `best_params`, `cv_best_val_accuracy`
     y `tuning_trials` (todas las combinaciones probadas, para auditar la
     búsqueda a posteriori en vez de solo confiar en la ganadora)."""
+    if horizon not in HORIZON_COLUMNS:
+        raise ValueError(f"horizon desconocido: {horizon!r} (válidos: {sorted(HORIZON_COLUMNS)})")
+    target_col = HORIZON_COLUMNS[horizon][1]
+    df = df[df[target_col].notna()].copy()
+
     train_df, test_df = temporal_split(df)
     if train_df.empty or test_df.empty:
         raise ValueError(
             "Split temporal vacío (train o test): ¿hay suficiente histórico "
-            f"en gold_train para separar los últimos {TEST_PERIOD_MONTHS} meses?"
+            f"en gold_train (horizonte={horizon}) para separar los últimos {TEST_PERIOD_MONTHS} meses?"
         )
 
     folds = _time_series_folds(train_df, n_splits=n_splits)
@@ -381,9 +421,9 @@ def tune_lightgbm(df: pd.DataFrame, n_iter: int = 20, n_splits: int = 3, random_
         fold_scores = []
         for train_mask, val_mask in folds:
             x_tr = build_feature_matrix(train_df[train_mask])
-            y_tr = train_df.loc[train_mask, "target_up_down"].astype(int)
+            y_tr = train_df.loc[train_mask, target_col].astype(int)
             x_val = build_feature_matrix(train_df[val_mask])
-            y_val = train_df.loc[val_mask, "target_up_down"].astype(int)
+            y_val = train_df.loc[val_mask, target_col].astype(int)
             fold_model = _make_lgbm(params, random_state)
             fold_model.fit(x_tr, y_tr)
             fold_scores.append(accuracy_score(y_val, fold_model.predict(x_val)))
@@ -395,8 +435,8 @@ def tune_lightgbm(df: pd.DataFrame, n_iter: int = 20, n_splits: int = 3, random_
 
     x_train = build_feature_matrix(train_df)
     x_test = build_feature_matrix(test_df)
-    y_train = train_df["target_up_down"].astype(int)
-    y_test = test_df["target_up_down"].astype(int)
+    y_train = train_df[target_col].astype(int)
+    y_test = test_df[target_col].astype(int)
 
     final_model = _make_lgbm(best_params, random_state)
     final_model.fit(x_train, y_train)
@@ -408,6 +448,7 @@ def tune_lightgbm(df: pd.DataFrame, n_iter: int = 20, n_splits: int = 3, random_
     return {
         "model": final_model,
         "model_type": "lightgbm",
+        "horizon": horizon,
         "feature_names": FEATURE_NAMES,
         "train_rows": len(train_df),
         "test_rows": len(test_df),
@@ -439,14 +480,25 @@ def save_model(result: dict) -> tuple[str, Path]:
     se guardan `best_params`/`cv_best_val_accuracy` para dejar constancia
     de con qué hiperparámetros se entrenó — NO se guarda `tuning_trials`
     (puede ser largo y es solo de interés puntual al momento de tunear,
-    no algo que el dashboard necesite cargar en cada arranque)."""
+    no algo que el dashboard necesite cargar en cada arranque).
+
+    `model_version` incluye el horizonte (`_hN_`, 2026-08-13, ver
+    CONTEXTO.md "Horizontes de predicción: semana y mes") para poder tener
+    varios modelos (día/semana/mes) conviviendo en `MODELS_DIR` a la vez y
+    elegir el correcto por horizonte en `predict.py`/el dashboard, sin
+    tocar el esquema de `predictions` (su `model_version` es un texto
+    libre, así que no hace falta migrar nada). Los modelos guardados ANTES
+    de este cambio no tienen `_hN_` en su nombre — se tratan como
+    horizonte 1 por convención (ver `predict.latest_model_path`)."""
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
-    model_version = f"{result['model_type']}_{datetime.now():%Y%m%d%H%M%S}"
+    horizon = result.get("horizon", DEFAULT_PREDICTION_HORIZON)
+    model_version = f"{result['model_type']}_h{horizon}_{datetime.now():%Y%m%d%H%M%S}"
     path = MODELS_DIR / f"{model_version}.joblib"
     bundle = {
         "model": result["model"],
         "feature_names": result["feature_names"],
         "model_type": result["model_type"],
+        "horizon": horizon,
         "train_rows": result["train_rows"],
         "test_rows": result["test_rows"],
         "train_date_max": result["train_date_max"],
@@ -465,6 +517,11 @@ def save_model(result: dict) -> tuple[str, Path]:
 
 
 def print_report(result: dict) -> None:
+    horizon = result.get("horizon", DEFAULT_PREDICTION_HORIZON)
+    print(
+        f"[model] --- horizonte: {horizon} sesión(es) ({PREDICTION_HORIZONS.get(horizon, '?')}) ---",
+        file=sys.stderr,
+    )
     print("[model] --- split temporal ---", file=sys.stderr)
     print(
         f"[model] train: {result['train_rows']} filas (hasta {result['train_date_max']}) | "
@@ -512,6 +569,11 @@ def main(argv: list[str] | None = None) -> int:
         "(tune_lightgbm) en vez de usar los valores por defecto.",
     )
     parser.add_argument("--tune-iterations", type=int, default=20, help="combinaciones a probar con --tune")
+    parser.add_argument(
+        "--horizon", type=int, choices=sorted(PREDICTION_HORIZONS), default=DEFAULT_PREDICTION_HORIZON,
+        help="sesiones de mercado vista: 1=día (por defecto), 5=semana, 20=mes "
+        "(ver CONTEXTO.md, 'Horizontes de predicción: semana y mes')",
+    )
     args = parser.parse_args(argv)
 
     if args.tune and args.model != "lightgbm":
@@ -525,9 +587,9 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     if args.tune:
-        result = tune_lightgbm(df, n_iter=args.tune_iterations)
+        result = tune_lightgbm(df, n_iter=args.tune_iterations, horizon=args.horizon)
     else:
-        result = train_and_evaluate(df, model_type=args.model)
+        result = train_and_evaluate(df, model_type=args.model, horizon=args.horizon)
     print_report(result)
     model_version, path = save_model(result)
     print(f"[model] modelo guardado: {model_version} -> {path}", file=sys.stderr)

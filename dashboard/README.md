@@ -30,14 +30,22 @@ streamlit run ...` lo evita siempre.)
   en las páginas. Reutiliza `src/db.py`, `src/model.py`
   (`build_feature_matrix`, `FEATURE_NAMES`) y `src/predict.py`
   (`latest_model_path`) en vez de duplicar esa lógica.
-- **`views/inicio.py`** — KPIs generales (nº tickers, última fecha
-  cargada, nº predicciones, nº artículos de noticias) y cómo leer el
-  resto del dashboard.
-- **`views/predicciones.py`** — selector de ticker + horizonte (solo
-  "día" activo, ver CONTEXTO.md) + gráfico histórico con el backtest del
-  modelo superpuesto sobre ese ticker, marcando dónde empieza el test
-  real (nunca visto en entrenamiento) para no confundir precisión
-  "informativa" con la métrica oficial.
+- **`views/inicio.py`** (página "Resumen", entrada por defecto) —
+  primera versión de un dashboard unificado (2026-08-13, ver
+  CONTEXTO.md): KPIs generales + resumen agregado de las predicciones
+  más recientes (nueva función `get_latest_predictions_summary`) +
+  highlights de backtest, de acierto real en producción (solo la
+  versión de modelo más reciente), de importancia de features (top 5) y
+  de sentimiento de mercado, cada uno enlazando a su pestaña de detalle.
+  Explícitamente un v1 a pulir con el tiempo, no la versión final.
+- **`views/predicciones.py`** — selector de ticker + horizonte (día
+  activo desde el principio; semana/mes activos desde 2026-08-13 EN
+  CUANTO haya un modelo entrenado para ellos — `model.py --horizon 5/20`,
+  ver CONTEXTO.md "Horizontes de predicción: semana y mes" — si no,
+  avisa en vez de fingir un resultado) + gráfico histórico con el
+  backtest del modelo superpuesto sobre ese ticker, marcando dónde
+  empieza el test real (nunca visto en entrenamiento) para no confundir
+  precisión "informativa" con la métrica oficial.
 - **`views/importancia_de_features.py`** — importancia global de
   features (una sola, compartida por todos los tickers — el modelo no
   usa el ticker como feature).
@@ -46,6 +54,22 @@ streamlit run ...` lo evita siempre.)
   no tiene métricas guardadas (modelos entrenados antes de que
   `model.save_model()` empezara a persistirlas), lo avisa y pide
   reentrenar en vez de mostrar datos inventados o vacíos sin explicación.
+- **`views/seguimiento_real.py`** (nuevo, 2026-08-13) — acierto REAL en
+  producción (`predictions.actual_target_up_down`, rellenado por
+  `src/track_predictions.py`), no backtest. Regla de oro: nunca mezcla
+  `model_version` distintos en el mismo cálculo de acierto — tabla
+  resumen por versión + gráfico de evolución día a día de la versión
+  elegida, con aviso explícito de que las ~208 predicciones de un mismo
+  día NO son observaciones independientes (ver CONTEXTO.md, "Seguimiento
+  real de predicciones").
+- **`views/sentimiento_por_accion.py`** / **`views/sentimiento_del_mercado.py`**
+  (nuevas, 2026-08-13) — cuadros de mando de noticias/sentimiento, por
+  ticker y agregado de mercado. Puramente informativas: la investigación
+  del mismo día (CONTEXTO.md, "¿Ayuda el sentimiento de noticias a
+  acertar más?") no encontró correlación real con la dirección del
+  precio, así que ninguna de las dos insinúa que el sentimiento predice
+  nada. Manejan el caso de tickers sin cobertura todavía (backfill en
+  marcha) mostrando un aviso en vez de gráficos vacíos.
 
 **¿Por qué `views/` y no la clásica `pages/` de Streamlit?** Con
 `st.navigation()`, tener además una carpeta llamada `pages/` junto al
@@ -80,7 +104,11 @@ control de componentes.
 ## Probado con
 
 `streamlit.testing.v1.AppTest` (ejecuta cada página server-side sin
-necesitar navegador) contra una copia de la base de datos real de 208
-tickers — las cuatro páginas cargan sin excepciones, incluyendo cambiar
-de ticker y seleccionar un horizonte deshabilitado. Navegación entre
-páginas probada con `AppTest.switch_page("views/<archivo>.py")`.
+necesitar navegador) contra la base de datos real de 208 tickers — las
+siete páginas cargan sin excepciones, incluyendo cambiar de ticker,
+cambiar entre los tres horizontes en "Predicciones" (día con modelo real;
+semana/mes muestran el aviso de "todavía no entrenado" en vez de
+romperse, ver CONTEXTO.md), cambiar de `model_version` en "Día a día", y
+ver un ticker sin cobertura de noticias todavía en "Noticias de la
+acción". Navegación entre páginas probada con
+`AppTest.switch_page("views/<archivo>.py")`.

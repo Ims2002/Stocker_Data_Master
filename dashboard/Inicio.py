@@ -34,10 +34,13 @@ ui.inject_css()
 ui.render_logo()
 
 pages = [
-    st.Page("views/inicio.py", title="Inicio", default=True),
+    st.Page("views/inicio.py", title="Resumen", default=True),
     st.Page("views/predicciones.py", title="Predicciones"),
     st.Page("views/importancia_de_features.py", title="En qué se fija"),
     st.Page("views/rendimiento_del_modelo.py", title="¿Funciona de verdad?"),
+    st.Page("views/seguimiento_real.py", title="Día a día"),
+    st.Page("views/sentimiento_por_accion.py", title="Noticias de la acción"),
+    st.Page("views/sentimiento_del_mercado.py", title="Sentimiento del mercado"),
 ]
 pg = st.navigation(pages, position="top")
 pg.run()

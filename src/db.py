@@ -135,6 +135,16 @@ daily_prices = Table(
 )
 
 # --- gold_train (gold) — SOLO para entrenar/evaluar, todos los tickers -----
+# Horizontes de predicción (2026-08-13, ver CONTEXTO.md "Horizontes de
+# predicción: semana y mes"): además del target a 1 sesión (close_next_day/
+# target_up_down, obligatorio, nunca NULL salvo la última fila —excluida
+# de gold_train antes de llegar aquí), se guardan los targets a 5 y 20
+# sesiones (config.PREDICTION_HORIZONS). A diferencia del de 1 sesión,
+# estos SÍ pueden ser NULL dentro de gold_train: las últimas 5/20 filas de
+# cada ticker (excluyendo ya la fila `is_last`, que ni siquiera llega
+# aquí) no tienen suficientes sesiones futuras para calcularlos. Cada
+# horizonte se entrena/filtra por separado en model.py (dropna sobre su
+# propia columna de target), nunca mezclado con los demás.
 gold_train = Table(
     "gold_train",
     metadata,
@@ -144,8 +154,20 @@ gold_train = Table(
     # Labels — solo existen en train, nunca en inference.
     Column("close_next_day", Float, nullable=False),
     Column("target_up_down", Integer, nullable=False),
+    Column("close_5d", Float, nullable=True),
+    Column("target_up_down_5d", Integer, nullable=True),
+    Column("close_20d", Float, nullable=True),
+    Column("target_up_down_20d", Integer, nullable=True),
     ForeignKeyConstraint(["ticker", "date"], ["daily_prices.ticker", "daily_prices.date"]),
     CheckConstraint("target_up_down IN (0, 1)", name="ck_gold_train_target_binary"),
+    CheckConstraint(
+        "target_up_down_5d IS NULL OR target_up_down_5d IN (0, 1)",
+        name="ck_gold_train_target_5d_binary",
+    ),
+    CheckConstraint(
+        "target_up_down_20d IS NULL OR target_up_down_20d IN (0, 1)",
+        name="ck_gold_train_target_20d_binary",
+    ),
 )
 
 # --- gold_inference (gold) — SOLO para predecir "mañana", todos los tickers -
@@ -256,18 +278,26 @@ def _migrate_gold_tables(engine: Engine) -> None:
     (delete+insert) en cada ejecución — no hay nada que perder que no se
     regenere solo con `python gold.py`.
 
-    El marcador es `news_sentiment_3d` (la columna más reciente): si
-    falta, cualquier esquema anterior a este (con o sin rsi_14) también
-    se recrea, sin necesidad de comprobar cada columna añadida por
-    separado."""
+    El marcador es `news_sentiment_3d` (columna de features, compartida por
+    ambas tablas): si falta, cualquier esquema anterior a este (con o sin
+    rsi_14) también se recrea, sin necesidad de comprobar cada columna
+    añadida por separado. `gold_train` tiene además su propio marcador,
+    `target_up_down_5d` (2026-08-13, ver CONTEXTO.md "Horizontes de
+    predicción: semana y mes") — no existe en `gold_inference` (que nunca
+    lleva columnas de label), así que se comprueba aparte."""
     with engine.begin() as conn:
         for table_name in ("gold_train", "gold_inference"):
             cols = [row[1] for row in conn.execute(text(f"PRAGMA table_info({table_name})"))]
-            if cols and "news_sentiment_3d" not in cols:
+            if not cols:
+                continue
+            missing_marker = "news_sentiment_3d" not in cols
+            missing_horizon_marker = table_name == "gold_train" and "target_up_down_5d" not in cols
+            if missing_marker or missing_horizon_marker:
                 print(
-                    f"[db] {table_name} con esquema antiguo (sin las features nuevas) — se recrea "
-                    "vacía (ver CONTEXTO.md, 'Ampliación de features' 2026-08-06 / 'Preparación de "
-                    "noticias como feature' 2026-08-08). Ejecuta `python gold.py` después para repoblarla.",
+                    f"[db] {table_name} con esquema antiguo — se recrea vacía (ver CONTEXTO.md, "
+                    "'Ampliación de features' 2026-08-06 / 'Preparación de noticias como feature' "
+                    "2026-08-08 / 'Horizontes de predicción: semana y mes' 2026-08-13). Ejecuta "
+                    "`python gold.py` después para repoblarla.",
                     file=sys.stderr,
                 )
                 conn.execute(text(f"DROP TABLE {table_name}"))

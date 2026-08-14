@@ -148,6 +148,21 @@ MIN_HISTORY_ROWS_FOR_GOLD = 40
 TEST_PERIOD_MONTHS = 6
 MODELS_DIR = BASE_DIR / "models"
 
+# --- Horizontes de predicción (2026-08-13, ver CONTEXTO.md "Horizontes de
+# predicción: semana y mes") ---
+# Hasta ahora solo existía target a 1 sesión de mercado (mañana). Se añaden
+# 5 sesiones (~1 semana de mercado) y 20 sesiones (~1 mes de mercado —
+# ~21 sesiones/mes en realidad, se redondea a 20 por simplicidad y porque
+# ya es la ventana usada en ma_20/return_20d/volatility_10d, así no se
+# introduce un número nuevo sin precedente en el proyecto). Las claves son
+# SESIONES DE MERCADO, no días naturales — mismo criterio que
+# target_up_down a 1 día (gold.py: shift() sobre la serie ordenada por
+# fecha de cada ticker, nunca "N días naturales después"). El valor es la
+# etiqueta corta usada para nombrar model_version (ver model.py) y para
+# las etiquetas del selector en el dashboard.
+PREDICTION_HORIZONS = {1: "dia", 5: "semana", 20: "mes"}
+DEFAULT_PREDICTION_HORIZON = 1
+
 # --- Noticias y sentimiento (Alpha Vantage) ---
 # Fuente NUEVA respecto al resto del pipeline (yfinance cubre solo precios).
 # Decisión explícita del usuario (2026-07-30) tras comparar tres opciones —

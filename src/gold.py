@@ -32,8 +32,21 @@ from sqlalchemy.engine import Engine
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import db as dbmod  # noqa: E402
-from config import MIN_HISTORY_ROWS_FOR_GOLD, TICKERS  # noqa: E402
+from config import MIN_HISTORY_ROWS_FOR_GOLD, PREDICTION_HORIZONS, TICKERS  # noqa: E402
 from features import ROLLING_FEATURE_COLUMNS, attach_news_features, compute_features  # noqa: E402
+
+# Nombre de columna (close_Nd, target_up_down_Nd) por horizonte (sesiones
+# de mercado) — horizonte 1 usa los nombres históricos sin sufijo
+# (close_next_day/target_up_down) para no romper el esquema/dashboards ya
+# existentes; 5 y 20 son las columnas nuevas (ver CONTEXTO.md, "Horizontes
+# de predicción: semana y mes", 2026-08-13).
+HORIZON_COLUMNS = {
+    horizon: (
+        ("close_next_day", "target_up_down") if horizon == 1
+        else (f"close_{horizon}d", f"target_up_down_{horizon}d")
+    )
+    for horizon in PREDICTION_HORIZONS
+}
 
 # Columnas de features que va a llevar gold_train/gold_inference (crudas +
 # derivadas por features.py) — no incluye ticker/date, que se añaden
@@ -113,9 +126,18 @@ def build_gold_frames(
     feat = compute_features(raw)
     feat = attach_news_features(feat, news)
 
-    # Target: shift(-1) sobre Close (no adj_close), tal como fija CONTEXTO.md.
-    feat["close_next_day"] = feat["close"].shift(-1)
-    feat["target_up_down"] = (feat["close_next_day"] > feat["close"]).astype("float")
+    # Targets por horizonte: shift(-N sesiones) sobre Close (no adj_close),
+    # tal como fija CONTEXTO.md para el horizonte de 1 sesión, generalizado
+    # a 5/20 (ver CONTEXTO.md, "Horizontes de predicción: semana y mes",
+    # 2026-08-13). IMPORTANTE: una comparación normal `(close_nd > close)`
+    # con NaN a la izquierda devuelve False, no NaN (comportamiento de
+    # numpy) — sin el `.where()` de abajo, las últimas N-1 filas de cada
+    # ticker (dentro de las que sí entran en train, ver `is_last` más
+    # abajo) quedarían mal etiquetadas como "baja" en vez de excluidas.
+    for horizon, (close_col, target_col) in HORIZON_COLUMNS.items():
+        feat[close_col] = feat["close"].shift(-horizon)
+        raw_target = (feat[close_col] > feat["close"]).astype("float")
+        feat[target_col] = raw_target.where(feat[close_col].notna())
 
     complete = feat[ROLLING_FEATURE_COLUMNS].notna().all(axis=1)
     last_date = feat["date"].max()
@@ -124,11 +146,29 @@ def build_gold_frames(
     train_df = feat[(~is_last) & complete & feat["target_up_down"].notna()].copy()
     train_df["target_up_down"] = train_df["target_up_down"].astype(int)
     train_df["ticker"] = ticker
+    # NaN -> None explícito SOLO en las columnas nullable de horizonte
+    # largo (close_5d/target_up_down_5d/close_20d/target_up_down_20d):
+    # `to_dict(orient="records")` deja NaN tal cual para columnas float,
+    # y sqlite no debe recibir NaN en una columna con CHECK ... IN (0, 1)
+    # — necesita NULL de verdad. Se hace columna a columna (no con un
+    # `.astype(object).where(...)` sobre todo el DataFrame) para no tocar
+    # el dtype de las demás columnas (features, ticker, date) sin motivo.
+    for horizon, (close_col, target_col) in HORIZON_COLUMNS.items():
+        if horizon == 1:
+            continue
+        close_mask = train_df[close_col].notna()
+        train_df[close_col] = train_df[close_col].astype(object).where(close_mask, None)
+        target_mask = train_df[target_col].notna()
+        # Int64 (nullable) primero para que los valores presentes se
+        # inserten como enteros de verdad (0/1), no como 0.0/1.0 — la
+        # columna en gold_train es Integer, no Float.
+        train_df[target_col] = train_df[target_col].astype("Int64").astype(object).where(target_mask, None)
 
     inference_df = feat[is_last & complete].copy()
     inference_df["ticker"] = ticker
 
-    train_cols = ["ticker", "date", *_GOLD_FEATURE_COLUMNS, "close_next_day", "target_up_down"]
+    horizon_cols = [col for pair in HORIZON_COLUMNS.values() for col in pair]
+    train_cols = ["ticker", "date", *_GOLD_FEATURE_COLUMNS, *horizon_cols]
     inference_cols = ["ticker", "date", *_GOLD_FEATURE_COLUMNS]
 
     return train_df[train_cols], inference_df[inference_cols]

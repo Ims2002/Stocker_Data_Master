@@ -15,10 +15,12 @@ dashboard.
 
 from __future__ import annotations
 
+import datetime as dt
 import sys
 from pathlib import Path
 
 import joblib
+import numpy as np
 import pandas as pd
 from sqlalchemy import select, text
 from sqlalchemy.engine import Engine
@@ -454,3 +456,174 @@ def feature_importances(bundle: dict) -> pd.DataFrame | None:
         "importancia": values,
     })
     return df.sort_values("importancia", ascending=False).reset_index(drop=True)
+
+
+# --- Análisis adicionales sobre el test oficial (2026-08-17) ------------
+# Régimen de volatilidad, confianza y comparativa de horizontes reutilizan
+# el mismo helper: aplicar el modelo cargado sobre las filas de gold_train
+# del PERIODO DE TEST OFICIAL del propio bundle (bundle["test_date_min"]),
+# nunca sobre train — evaluar sobre train daría una imagen artificialmente
+# buena, ver "Contrato de evaluación" en CONTEXTO.md.
+
+def _test_set_predictions(engine: Engine, bundle: dict) -> pd.DataFrame:
+    """Filas de `gold_train` en el periodo de test oficial del bundle
+    (`date >= test_date_min`), con la predicción y probabilidad del
+    modelo ya calculadas (`pred`, `proba_up`, `acierto`). Devuelve vacío
+    si el bundle no tiene `test_date_min` (modelos guardados antes de que
+    `model.save_model()` empezara a persistirlo) o si no hay filas con
+    target calculado para el horizonte del bundle en ese periodo."""
+    horizon = bundle.get("horizon", DEFAULT_PREDICTION_HORIZON)
+    target_col = "target_up_down" if horizon == 1 else f"target_up_down_{horizon}d"
+    test_date_min = bundle.get("test_date_min")
+    if not test_date_min:
+        return pd.DataFrame()
+    test_date = dt.date.fromisoformat(str(test_date_min))
+    with engine.begin() as conn:
+        result = conn.execute(dbmod.gold_train.select().where(dbmod.gold_train.c.date >= test_date))
+        rows = result.fetchall()
+        columns = result.keys()
+    df = pd.DataFrame(rows, columns=columns)
+    if df.empty:
+        return df
+    df = df[df[target_col].notna()].copy()
+    if df.empty:
+        return df
+    x = build_feature_matrix(df)
+    proba_up = bundle["model"].predict_proba(x)[:, 1]
+    df["proba_up"] = proba_up
+    df["pred"] = (proba_up >= 0.5).astype(int)
+    df["acierto"] = df["pred"] == df[target_col]
+    return df
+
+
+def get_accuracy_by_volatility(engine: Engine, bundle: dict) -> pd.DataFrame:
+    """Acierto del modelo (test oficial) segmentado en terciles de
+    `volatility_10d` (Baja/Media/Alta) — para comprobar si acierta más en
+    mercados tranquilos que en agitados. Terciles calculados sobre el
+    propio test set, no sobre un umbral fijo a mano, para que la
+    comparación sea siempre sobre grupos de tamaño similar. Vacío si no
+    hay suficientes filas para formar 3 grupos con datos distintos."""
+    df = _test_set_predictions(engine, bundle)
+    if df.empty:
+        return pd.DataFrame()
+    df = df[df["volatility_10d"].notna()]
+    if len(df) < 30:
+        return pd.DataFrame()
+    try:
+        df = df.assign(
+            bucket=pd.qcut(df["volatility_10d"], 3, labels=["Baja", "Media", "Alta"], duplicates="drop")
+        )
+    except ValueError:
+        return pd.DataFrame()
+    return (
+        df.groupby("bucket", observed=True)
+        .agg(n=("acierto", "size"), acierto=("acierto", "mean"))
+        .reset_index()
+    )
+
+
+def get_confidence_accuracy(engine: Engine, bundle: dict, threshold: float = 0.6) -> dict | None:
+    """Compara el acierto (test oficial) de TODAS las predicciones frente
+    al del subconjunto de "alta confianza" (probabilidad a favor de la
+    clase predicha >= `threshold`) — para ver si el modelo discrimina
+    mejor cuando está más seguro de sí mismo. None si el bundle no tiene
+    test set evaluable."""
+    df = _test_set_predictions(engine, bundle)
+    if df.empty:
+        return None
+    confianza = np.maximum(df["proba_up"], 1 - df["proba_up"])
+    alta = df[confianza >= threshold]
+    return {
+        "n_total": len(df),
+        "acierto_total": float(df["acierto"].mean()),
+        "n_alta": len(alta),
+        "acierto_alta": float(alta["acierto"].mean()) if not alta.empty else None,
+        "pct_alta": len(alta) / len(df) if len(df) else 0.0,
+        "threshold": threshold,
+    }
+
+
+def get_horizon_comparison(engine: Engine) -> pd.DataFrame:
+    """Backtest oficial (modelo vs. los dos baselines) de la versión más
+    reciente de CADA horizonte entrenado (día/semana/mes, ver
+    `config.PREDICTION_HORIZONS`) — para comparar si hay más señal
+    explotable a más plazo. Los horizontes sin ningún modelo entrenado
+    todavía aparecen con `disponible=False`, nunca con una fila
+    inventada — mismo criterio de honestidad que el resto del dashboard
+    (ver CONTEXTO.md)."""
+    rows = []
+    for horizon, etiqueta in PREDICTION_HORIZONS.items():
+        try:
+            bundle = load_latest_model(horizon=horizon)
+        except FileNotFoundError:
+            rows.append({"horizon": horizon, "etiqueta": etiqueta, "disponible": False})
+            continue
+        if "metrics_model" not in bundle:
+            rows.append({"horizon": horizon, "etiqueta": etiqueta, "disponible": False})
+            continue
+        rows.append({
+            "horizon": horizon,
+            "etiqueta": etiqueta,
+            "disponible": True,
+            "model_version": bundle.get("_model_version"),
+            "accuracy_modelo": bundle["metrics_model"]["accuracy"],
+            "accuracy_mayoritario": bundle["metrics_majority_baseline"]["accuracy"],
+            "accuracy_persistencia": bundle["metrics_persistence_baseline"]["accuracy"],
+            "test_rows": bundle.get("test_rows"),
+        })
+    return pd.DataFrame(rows)
+
+
+def get_market_breadth_history(
+    engine: Engine, horizon: int = DEFAULT_PREDICTION_HORIZON, days: int = 90
+) -> pd.DataFrame:
+    """Evolución histórica del % de tickers que el modelo predijo "sube"
+    cada sesión, para un horizonte concreto (deducido de cada
+    `model_version` vía `predict.horizon_from_model_version`, igual que
+    `get_latest_prediction`/`track_predictions.py`). A diferencia de
+    `get_resolved_predictions()`, aquí SÍ se pueden combinar varias
+    `model_version` en el mismo cálculo: no se mide acierto (donde
+    mezclar versiones sí sería engañoso, ver CONTEXTO.md), solo qué
+    fracción predijo "sube" cada día — una lectura de la propia
+    inclinación del modelo sobre el mercado, no una métrica de
+    rendimiento."""
+    with engine.begin() as conn:
+        rows = conn.execute(
+            select(
+                dbmod.predictions.c.date_predicha,
+                dbmod.predictions.c.model_version,
+                dbmod.predictions.c.predicted_target_up_down,
+            )
+        ).fetchall()
+    df = pd.DataFrame(rows, columns=["date_predicha", "model_version", "predicted_target_up_down"])
+    if df.empty:
+        return df
+    df["horizon_pred"] = df["model_version"].apply(predictmod.horizon_from_model_version)
+    df = df[df["horizon_pred"] == horizon]
+    if df.empty:
+        return df
+    resumen = (
+        df.groupby("date_predicha")
+        .agg(n_total=("predicted_target_up_down", "size"), n_up=("predicted_target_up_down", "sum"))
+        .reset_index()
+    )
+    resumen["pct_up"] = resumen["n_up"] / resumen["n_total"]
+    resumen["date_predicha"] = pd.to_datetime(resumen["date_predicha"])
+    resumen = resumen.sort_values("date_predicha")
+    cutoff = resumen["date_predicha"].max() - pd.Timedelta(days=days)
+    return resumen[resumen["date_predicha"] >= cutoff].reset_index(drop=True)
+
+
+def get_tickers_by_sector(engine: Engine) -> pd.DataFrame:
+    """Tickers con datos reales (mismo criterio que `list_tickers`: solo
+    los que tienen fila en `daily_prices`, para no listar los huérfanos
+    de `stocks` como FI/MMC/BK/DFS/HES — ver CONTEXTO.md) junto con su
+    sector — base para el filtro por sector de los selectores de ticker
+    del dashboard."""
+    with engine.begin() as conn:
+        rows = conn.execute(
+            select(dbmod.stocks.c.ticker, dbmod.stocks.c.nombre, dbmod.stocks.c.sector)
+            .where(dbmod.stocks.c.ticker.in_(select(dbmod.daily_prices.c.ticker).distinct()))
+            .order_by(dbmod.stocks.c.ticker)
+        ).fetchall()
+    return pd.DataFrame(rows, columns=["ticker", "nombre", "sector"])

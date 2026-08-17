@@ -31,18 +31,23 @@ streamlit run ...` lo evita siempre.)
   (`build_feature_matrix`, `FEATURE_NAMES`) y `src/predict.py`
   (`latest_model_path`) en vez de duplicar esa lógica.
 - **`views/inicio.py`** (página "Resumen", entrada por defecto) —
-  primera versión de un dashboard unificado (2026-08-13, ver
-  CONTEXTO.md): KPIs generales + resumen agregado de las predicciones
-  más recientes (nueva función `get_latest_predictions_summary`) +
-  highlights de backtest, de acierto real en producción (solo la
-  versión de modelo más reciente), de importancia de features (top 5) y
-  de sentimiento de mercado, cada uno enlazando a su pestaña de detalle.
-  Explícitamente un v1 a pulir con el tiempo, no la versión final.
-- **`views/predicciones.py`** — selector de ticker + horizonte (día
+  primera versión de un dashboard unificado (2026-08-13, ampliado
+  2026-08-18, ver CONTEXTO.md): KPIs generales + resumen agregado de las
+  predicciones más recientes + amplitud de mercado histórica (% que
+  predijo "sube" cada sesión) + highlights de backtest + comparativa
+  entre horizontes (día/semana/mes) + acierto real en producción (solo
+  la versión de modelo más reciente) + importancia de features (top 5)
+  + acierto por régimen de volatilidad y por nivel de confianza de la
+  predicción + sentimiento de mercado, cada uno enlazando a su pestaña
+  de detalle. Explícitamente un v1 a pulir con el tiempo, no la versión
+  final.
+- **`views/predicciones.py`** — selector de sector (`stocks.sector`,
+  2026-08-18) + ticker (filtrado por el sector elegido) + horizonte (día
   activo desde el principio; semana/mes activos desde 2026-08-13 EN
   CUANTO haya un modelo entrenado para ellos — `model.py --horizon 5/20`,
   ver CONTEXTO.md "Horizontes de predicción: semana y mes" — si no,
-  avisa en vez de fingir un resultado) + gráfico histórico con el
+  avisa en vez de fingir un resultado; los tres horizontes ya tienen
+  modelo entrenado desde 2026-08-18) + gráfico histórico con el
   backtest del modelo superpuesto sobre ese ticker, marcando dónde
   empieza el test real (nunca visto en entrenamiento) para no confundir
   precisión "informativa" con la métrica oficial.
@@ -64,12 +69,14 @@ streamlit run ...` lo evita siempre.)
   real de predicciones").
 - **`views/sentimiento_por_accion.py`** / **`views/sentimiento_del_mercado.py`**
   (nuevas, 2026-08-13) — cuadros de mando de noticias/sentimiento, por
-  ticker y agregado de mercado. Puramente informativas: la investigación
-  del mismo día (CONTEXTO.md, "¿Ayuda el sentimiento de noticias a
-  acertar más?") no encontró correlación real con la dirección del
-  precio, así que ninguna de las dos insinúa que el sentimiento predice
-  nada. Manejan el caso de tickers sin cobertura todavía (backfill en
-  marcha) mostrando un aviso en vez de gráficos vacíos.
+  ticker (con el mismo selector de sector que "Predicciones", añadido
+  2026-08-18) y agregado de mercado. Puramente informativas: la
+  investigación del mismo día (CONTEXTO.md, "¿Ayuda el sentimiento de
+  noticias a acertar más?") no encontró correlación real con la
+  dirección del precio, así que ninguna de las dos insinúa que el
+  sentimiento predice nada. Manejan el caso de tickers sin cobertura
+  todavía (backfill en marcha) mostrando un aviso en vez de gráficos
+  vacíos.
 
 **¿Por qué `views/` y no la clásica `pages/` de Streamlit?** Con
 `st.navigation()`, tener además una carpeta llamada `pages/` junto al
@@ -106,9 +113,11 @@ control de componentes.
 `streamlit.testing.v1.AppTest` (ejecuta cada página server-side sin
 necesitar navegador) contra la base de datos real de 208 tickers — las
 siete páginas cargan sin excepciones, incluyendo cambiar de ticker,
-cambiar entre los tres horizontes en "Predicciones" (día con modelo real;
-semana/mes muestran el aviso de "todavía no entrenado" en vez de
-romperse, ver CONTEXTO.md), cambiar de `model_version` en "Día a día", y
-ver un ticker sin cobertura de noticias todavía en "Noticias de la
-acción". Navegación entre páginas probada con
+cambiar entre los tres horizontes en "Predicciones" (los tres con modelo
+real entrenado desde 2026-08-18), filtrar por sector en "Predicciones" y
+"Noticias de la acción" (verificado que el selector de ticker se
+actualiza a solo los tickers de ese sector), mover el slider de umbral de
+confianza en "Resumen", cambiar de `model_version` en "Día a día", y ver
+un ticker sin cobertura de noticias todavía en "Noticias de la acción".
+Navegación entre páginas probada con
 `AppTest.switch_page("views/<archivo>.py")`.

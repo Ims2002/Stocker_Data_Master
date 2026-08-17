@@ -35,6 +35,11 @@ def _tickers():
     return da.list_tickers(engine)
 
 
+@st.cache_data(ttl=300)
+def _tickers_by_sector():
+    return da.get_tickers_by_sector(engine)
+
+
 @st.cache_resource
 def _model_bundle(horizon: int):
     return da.load_latest_model(horizon=horizon)
@@ -45,9 +50,18 @@ if not tickers:
     st.error("No hay tickers con datos en daily_prices. Ejecuta antes download.py → load.py.")
     st.stop()
 
-col_a, col_b, col_c = st.columns([2, 2, 1])
+meta_tickers = _tickers_by_sector()
+sectores = ["Todos"] + sorted(meta_tickers["sector"].dropna().unique().tolist())
+
+col_s, col_a, col_b, col_c = st.columns([1.2, 1.6, 2, 1])
+with col_s:
+    sector = st.selectbox("Sector", sectores, index=0)
+tickers_filtrados = (
+    tickers if sector == "Todos"
+    else [t for t in tickers if t in set(meta_tickers.loc[meta_tickers["sector"] == sector, "ticker"])]
+) or tickers
 with col_a:
-    ticker = st.selectbox("Ticker", tickers, index=0)
+    ticker = st.selectbox("Ticker", tickers_filtrados, index=0)
 with col_b:
     horizonte_label = st.segmented_control(
         "Horizonte de predicción", list(HORIZON_LABELS.values()), default=HORIZON_LABELS[1],

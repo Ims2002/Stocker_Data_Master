@@ -37,6 +37,11 @@ def _tickers():
 
 
 @st.cache_data(ttl=300)
+def _tickers_by_sector():
+    return da.get_tickers_by_sector(engine)
+
+
+@st.cache_data(ttl=300)
 def _coverage():
     return da.news_coverage_status(engine)
 
@@ -47,7 +52,19 @@ if not tickers:
     st.stop()
 
 coverage = _coverage()
-ticker = st.selectbox("Ticker", tickers, index=0)
+
+meta_tickers = _tickers_by_sector()
+sectores = ["Todos"] + sorted(meta_tickers["sector"].dropna().unique().tolist())
+
+col_s, col_t = st.columns([1, 2])
+with col_s:
+    sector = st.selectbox("Sector", sectores, index=0)
+tickers_filtrados = (
+    tickers if sector == "Todos"
+    else [t for t in tickers if t in set(meta_tickers.loc[meta_tickers["sector"] == sector, "ticker"])]
+) or tickers
+with col_t:
+    ticker = st.selectbox("Ticker", tickers_filtrados, index=0)
 meta = da.get_ticker_metadata(engine, ticker)
 st.caption(
     f"**{meta.get('nombre') or ticker}** · {meta.get('sector') or 'sector desconocido'} · "

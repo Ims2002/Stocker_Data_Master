@@ -64,7 +64,7 @@ tickers_filtrados = (
     else [t for t in tickers if t in set(meta_tickers.loc[meta_tickers["sector"] == sector, "ticker"])]
 ) or tickers
 with col_t:
-    ticker = st.selectbox("Ticker", tickers_filtrados, index=0)
+    ticker = st.selectbox("Ticker", tickers_filtrados, index=da.default_ticker_index(tickers_filtrados))
 meta = da.get_ticker_metadata(engine, ticker)
 st.caption(
     f"**{meta.get('nombre') or ticker}** · {meta.get('sector') or 'sector desconocido'} · "

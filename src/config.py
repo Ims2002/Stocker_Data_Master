@@ -121,7 +121,15 @@ GOLD_DATA_DIR = DATA_DIR / "gold"
 # SQLite en el MVP (ver CONTEXTO.md); migración natural a PostgreSQL si se
 # escala a más tickers, sin que el resto del pipeline deba cambiar, siempre
 # que solo se acceda a la base de datos a través de DB_URL.
-DB_PATH = DATA_DIR / "stocker.db"
+#
+# Override opcional por variable de entorno (2026-08-27, ver CONTEXTO.md
+# "Roadmap v1 (MVP para publicar)"): la demo publicada usa una base de
+# datos reducida (data/stocker_demo.db, ~50 tickers en vez de 208, ver
+# src/export_demo_db.py) que no cabe en el mismo sitio que la real sin
+# pisarla. STOCKER_DB_PATH permite apuntar el despliegue a ese fichero
+# sin tocar ni un .bat programado ni ningún script del pipeline local —
+# si no está definida, el comportamiento es EXACTAMENTE el de siempre.
+DB_PATH = Path(os.environ["STOCKER_DB_PATH"]) if os.environ.get("STOCKER_DB_PATH") else DATA_DIR / "stocker.db"
 DB_URL = f"sqlite:///{DB_PATH}"
 
 # --- Calendario de mercado ---
@@ -146,7 +154,12 @@ MIN_HISTORY_ROWS_FOR_GOLD = 40
 # train. Corte único por fecha global (no por ticker), para que todos los
 # tickers compartan el mismo punto de corte train/test.
 TEST_PERIOD_MONTHS = 6
-MODELS_DIR = BASE_DIR / "models"
+# Mismo mecanismo de override que DB_PATH (ver arriba) — la demo publicada
+# usa models_demo/ (solo los 3 .joblib elegidos para publicar, un
+# subconjunto estable de models/) vía STOCKER_MODELS_DIR. Los modelos NO
+# se reentrenan para la demo: no usan el ticker como feature, sirven
+# igual sobre el subconjunto de tickers reducido (ver CONTEXTO.md).
+MODELS_DIR = Path(os.environ["STOCKER_MODELS_DIR"]) if os.environ.get("STOCKER_MODELS_DIR") else BASE_DIR / "models"
 
 # --- Horizontes de predicción (2026-08-13, ver CONTEXTO.md "Horizontes de
 # predicción: semana y mes") ---
@@ -245,4 +258,59 @@ NEWS_BACKFILL_WINDOW_DAYS = 180
 # tiene sentido que sea relativo a "hoy").
 NEWS_BACKFILL_REFERENCE_DATE = dt.date(2026, 8, 8)
 
+# --- Prioridad de tickers en la actualización diaria (2026-08-25, ver
+# CONTEXTO.md "Prioridad de noticias para tickers relevantes") ---
+# Petición del usuario: que un subconjunto de "las acciones más relevantes
+# del mercado" se actualice más a menudo que el resto en
+# `news.run_daily_update()`, en vez de quedar sujeto solo al muestreo
+# aleatorio uniforme sobre los 208 tickers (~cada 8-9 días de media).
+#
+# No hay ningún campo de capitalización bursátil real en la base de datos
+# (stocks) para ordenar "de verdad" por tamaño de mercado — en vez de
+# introducir una fuente de datos nueva solo para esto, se reutiliza el
+# orden ya existente de TICKERS (arriba), que el propio usuario ya dejó
+# empezando por los mega-caps: NVDA, AAPL, MSFT, AMZN, GOOGL, GOOG, AVGO,
+# META, TSLA, LLY... Se toman los primeros NEWS_PRIORITY_TICKERS_COUNT
+# como proxy de "relevancia de mercado". 50 es un punto intermedio del
+# rango pedido (25-100) — ajustar aquí si se quiere un set más grande o
+# más pequeño.
+NEWS_PRIORITY_TICKERS_COUNT = 50
+NEWS_PRIORITY_TICKERS = TICKERS[:NEWS_PRIORITY_TICKERS_COUNT]
+
+# Fracción de NEWS_DAILY_CALL_BUDGET reservada cada día para rotar por
+# NEWS_PRIORITY_TICKERS (ver news.run_daily_update — ronda determinista,
+# no aleatoria, para no repetir un ticker antes de haber pasado por todos
+# los demás). El resto del presupuesto sigue el muestreo aleatorio de
+# siempre, pero solo sobre los tickers NO prioritarios.
+#
+# Trade-off real y aceptado: el presupuesto total sigue siendo
+# NEWS_DAILY_CALL_BUDGET (25, límite del free tier de Alpha Vantage) — no
+# hay llamadas "extra" para los prioritarios, se les da más peso DENTRO
+# del mismo presupuesto. Con los valores por defecto (50 prioritarios,
+# 80% del presupuesto = 20 llamadas/día), los prioritarios rotan en
+# ceil(50/20) = 3 días; a cambio, los 158 restantes se reparten solo 5
+# llamadas/día en vez de las ~25 de antes, así que su frecuencia media de
+# refresco empeora de ~8-9 días a ~32 días. Se acepta porque el usuario
+# pidió explícitamente priorizar relevancia sobre cobertura uniforme.
+NEWS_PRIORITY_DAILY_SHARE = 0.8
+
 NEWS_RAW_DIR = DATA_DIR / "raw" / "news"
+
+# --- Logos de empresa (2026-08-28) ---
+# Petición del usuario: mostrar el logo de cada empresa en el dashboard
+# para hacerlo más visual. Clearbit Logo API (la opción obvia hace un
+# tiempo) cerró en diciembre 2025 — comprobado antes de elegir nada, ver
+# CONTEXTO.md "Logos de empresa en el dashboard". Se eligió Logo.dev
+# (sucesor oficial de Clearbit) sobre la alternativa sin cuenta
+# (AllInvestView Ticker Logos, gratis pero exige un enlace de atribución
+# visible en el dashboard) — decisión explícita del usuario: prefiere
+# crear una cuenta gratuita antes que mostrar una atribución de terceros
+# en un proyecto de máster.
+#
+# LOGO_DEV_TOKEN es una "publishable key" (pensada para ir en la URL de
+# una <img>, no es un secreto que haya que esconder del cliente) — aun
+# así se lee de entorno/.env, nunca hardcodeada, por si cambia de cuenta
+# o de plan. Sin ella configurada, el dashboard simplemente no muestra
+# logos (no rompe nada) — ver `dashboard/data_access.ticker_logo_url()`.
+# Consíguela gratis (sin tarjeta) en https://www.logo.dev/signup.
+LOGO_DEV_TOKEN = os.environ.get("LOGO_DEV_TOKEN", "")

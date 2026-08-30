@@ -15,11 +15,28 @@ data/gold/*
 *.sqlite
 *.sqlite3
 
+# EXCEPCIÓN (2026-08-27, ver CONTEXTO.md "Roadmap v1 (MVP para
+# publicar)" y docs/ROADMAP_MVP.md): la demo publicada del v1 SÍ versiona
+# una base de datos reducida (~50 tickers, ~60MB, generada con
+# src/export_demo_db.py — nunca la real de 254MB, esa sigue sin
+# versionarse). Por debajo del límite de 100MB/archivo de GitHub.
+!data/stocker_demo.db
+
 # Modelos entrenados: se regeneran con model.py, no se versionan (igual
 # que data/ — el repo lleva el código que los genera, no el binario).
 /models/
 *.joblib
 *.pkl
+
+# EXCEPCIÓN, mismo motivo que stocker_demo.db arriba: los 3 modelos
+# (día/semana/mes) elegidos para la demo publicada SÍ se versionan, en
+# una carpeta aparte de /models/ para no arrastrar el resto del
+# histórico de entrenamientos locales (~55MB con todos los intentos).
+# Los modelos no necesitan reentrenarse para el subconjunto de tickers
+# de la demo (no usan el ticker como feature) — son copias literales de
+# /models/, no una versión distinta.
+!/models_demo/
+!/models_demo/*.joblib
 
 # --- Python ---
 __pycache__/

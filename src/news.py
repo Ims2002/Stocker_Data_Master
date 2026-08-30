@@ -66,6 +66,8 @@ from config import (  # noqa: E402
     NEWS_BACKFILL_REFERENCE_DATE,
     NEWS_BACKFILL_WINDOW_DAYS,
     NEWS_DAILY_CALL_BUDGET,
+    NEWS_PRIORITY_DAILY_SHARE,
+    NEWS_PRIORITY_TICKERS,
     NEWS_RAW_DIR,
     NEWS_REQUEST_DELAY_SECONDS,
     NEWS_TICKERS_PER_CALL,
@@ -398,37 +400,74 @@ def run_daily_update(engine: Engine, max_calls: int = NEWS_DAILY_CALL_BUDGET) ->
     CORREGIDO 2026-08-06: con NEWS_TICKERS_PER_CALL=1 hay 208 lotes (uno
     por ticker), no ~21 como cuando se agrupaban 10 tickers por llamada —
     procesarlos todos en una ejecución superaría 8 veces el presupuesto
-    diario (NEWS_DAILY_CALL_BUDGET=25). Esta función ahora tope a
-    `max_calls` por ejecución y elige un subconjunto ALEATORIO de tickers
-    cada vez (en vez de round-robin con estado persistido, más simple de
-    mantener): en expectativa cada ticker se revisa cada ~208/25 ≈ 8-9
-    días, no a diario estricto. Se acepta este trade-off (frescura de
-    noticias más laxa) en vez de meter una tabla de cursor/estado nueva
-    solo para esto — si en el futuro hace falta un ciclo estrictamente
-    round-robin, es el punto a revisar."""
+    diario (NEWS_DAILY_CALL_BUDGET=25). Esta función tope a `max_calls`
+    por ejecución.
+
+    AMPLIADO 2026-08-25 (ver CONTEXTO.md, "Prioridad de noticias para
+    tickers relevantes" y config.py, NEWS_PRIORITY_TICKERS): dentro de ese
+    presupuesto, NEWS_PRIORITY_DAILY_SHARE se reserva para
+    NEWS_PRIORITY_TICKERS y se recorre en RONDA determinista (no
+    aleatoria) — el offset de cada día se deriva de
+    `date.today().toordinal()` (un entero que ya avanza uno por día de
+    calendario), así que no hace falta persistir ningún cursor: cada
+    prioritario se revisita exactamente cada
+    ceil(len(NEWS_PRIORITY_TICKERS) / llamadas_prioridad) días, sin saltos
+    ni repeticiones antes de completar la vuelta. El resto del
+    presupuesto sigue el muestreo ALEATORIO de siempre, pero restringido
+    a los tickers NO prioritarios (para no gastar dos veces el mismo día
+    en un ticker que ya le tocaba por ronda).
+
+    Trade-off real y aceptado (ver comentario en config.py junto a
+    NEWS_PRIORITY_DAILY_SHARE): el presupuesto total no cambia, solo se
+    reparte de forma desigual — los NO prioritarios pasan de refrescarse
+    cada ~8-9 días de media a cada ~30 días, a cambio de que los
+    prioritarios pasen a refrescarse cada pocos días. Asume
+    NEWS_TICKERS_PER_CALL == 1 (cada lote es un único ticker, ver
+    ticker_batches()) para poder etiquetar un lote entero como
+    prioritario/no prioritario sin ambigüedad."""
     import random
 
     batches = ticker_batches()
-    sample_size = min(max_calls, len(batches))
-    sampled = random.sample(list(enumerate(batches)), sample_size)
+    priority_set = set(NEWS_PRIORITY_TICKERS)
+    priority_ids = [i for i, b in enumerate(batches) if b[0] in priority_set]
+    other_ids = [i for i, b in enumerate(batches) if b[0] not in priority_set]
+
+    priority_calls = 0
+    if priority_ids:
+        priority_calls = min(len(priority_ids), max(1, round(max_calls * NEWS_PRIORITY_DAILY_SHARE)))
+    other_calls = max(0, max_calls - priority_calls)
+
+    priority_batch_ids: list[int] = []
+    if priority_ids and priority_calls:
+        offset = (dt.date.today().toordinal() * priority_calls) % len(priority_ids)
+        priority_batch_ids = [priority_ids[(offset + k) % len(priority_ids)] for k in range(priority_calls)]
+
+    other_sample_size = min(other_calls, len(other_ids))
+    other_batch_ids = random.sample(other_ids, other_sample_size) if other_sample_size > 0 else []
+
+    selected = [(bid, batches[bid]) for bid in priority_batch_ids + other_batch_ids]
+    priority_ids_selected = set(priority_batch_ids)
+
     yesterday = dt.date.today() - dt.timedelta(days=1)
     today = dt.date.today()
 
     calls_made = 0
-    for batch_id, tickers_in_batch in sampled:
+    for batch_id, tickers_in_batch in selected:
+        etiqueta = "prioritario" if batch_id in priority_ids_selected else "aleatorio"
         try:
             data = fetch_news_batch(tickers_in_batch, yesterday, today)
             save_raw_json(data, batch_id, yesterday)
             n = upsert_articles(data, set(tickers_in_batch), engine)
-            print(f"[news] lote {batch_id}: {n} filas de sentimiento (actualización diaria)", file=sys.stderr)
+            print(f"[news] lote {batch_id} ({etiqueta}): {n} filas de sentimiento (actualización diaria)", file=sys.stderr)
         except Exception as exc:  # noqa: BLE001
-            print(f"[news] lote {batch_id}: FALLÓ la actualización diaria ({exc})", file=sys.stderr)
+            print(f"[news] lote {batch_id} ({etiqueta}): FALLÓ la actualización diaria ({exc})", file=sys.stderr)
         calls_made += 1
         time.sleep(NEWS_REQUEST_DELAY_SECONDS)
 
     print(
-        f"[news] actualización diaria: {calls_made} llamada(s) hecha(s) de {len(batches)} tickers "
-        "totales (muestra aleatoria, ver docstring de run_daily_update).",
+        f"[news] actualización diaria: {calls_made} llamada(s) hecha(s) de {len(batches)} tickers totales "
+        f"({len(priority_batch_ids)} prioritarios en ronda determinista + {len(other_batch_ids)} aleatorios "
+        "del resto, ver docstring de run_daily_update).",
         file=sys.stderr,
     )
 

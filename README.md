@@ -30,15 +30,17 @@ encontrados y corregidos — está documentado en
   resultado tal cual, gane o no el modelo (ver "Honestidad de resultado"
   en CONTEXTO.md).
 - Genera y persiste una predicción por ticker para la siguiente sesión de
-  mercado real.
+  mercado real, a tres horizontes (día/semana/mes, ver "Horizontes de
+  predicción" en CONTEXTO.md).
 - Dashboard interactivo (Streamlit) para explorar todo lo anterior — ver
   más abajo.
 
-Queda fuera de esta fase: horizontes de predicción a semana/mes (la UI ya
-tiene el selector preparado, pero solo día está entrenado), usar el
-sentimiento de noticias como feature del modelo, y el mercado español
-(aparcado por falta de calendario de mercado BME en las librerías
-usadas).
+Queda fuera de esta fase: usar el sentimiento de noticias como feature
+del modelo (investigado, sin señal real encontrada — ver CONTEXTO.md),
+el mercado español (aparcado por falta de calendario de mercado BME en
+las librerías usadas), y actualización automática de la versión
+publicada (ver "Demo publicada" más abajo — es una foto fija, no un
+producto vivo).
 
 ## Instalación
 
@@ -78,29 +80,65 @@ que ha corrido.
 ## El dashboard
 
 ```bash
-streamlit run dashboard/Inicio.py
+python -m streamlit run dashboard/Inicio.py
 ```
 
-Tres páginas, todas de solo lectura sobre `data/stocker.db` (el dashboard
-nunca escribe nada — eso lo hacen los scripts de `src/`):
+(`streamlit run ...` a secas puede fallar en Git Bash en Windows si el
+directorio de scripts de pip no está en el PATH — `python -m streamlit
+run ...` lo evita siempre.)
 
-- **Predicciones** — selector de ticker y de horizonte (solo "día" está
-  activo; semana/mes están en la interfaz pero deshabilitados, ver
-  CONTEXTO.md), gráfico de histórico real con el backtest del modelo
-  superpuesto (aciertos/fallos, marcando claramente dónde empieza el
-  test real nunca visto por el modelo) y la predicción para la próxima
-  sesión.
-- **Importancia de features** — qué variables pesan más en el modelo
-  (una sola importancia global, el modelo no usa el ticker como
-  feature).
-- **Rendimiento del modelo** — modelo vs. baselines obligatorios sobre
-  el test temporal real, con el mismo criterio de honestidad de
-  resultado que el resto del proyecto.
+Cinco páginas registradas en el v1 (ver "Roadmap v1" más abajo), todas de
+solo lectura sobre `data/stocker.db` y `models/` (el dashboard nunca
+escribe nada — eso lo hacen los scripts de `src/`):
+
+- **Dashboard** (entrada) — vista única recentrada en la acción que
+  elijas: predicción para el horizonte elegido (día/semana/mes),
+  histórico con aciertos/fallos del backtest, últimas noticias de esa
+  acción y un resumen en texto generado a partir de los mismos datos.
+- **Predicciones** — selector de ticker, sector y horizonte, gráfico de
+  histórico real con el backtest del modelo superpuesto (marcando
+  claramente dónde empieza el test real nunca visto por el modelo) y la
+  predicción para la próxima sesión.
+- **En qué se fija** (importancia de features) — qué variables pesan más
+  en el modelo (una sola importancia global, el modelo no usa el ticker
+  como feature).
+- **¿Funciona de verdad?** (rendimiento del modelo) — modelo vs.
+  baselines obligatorios sobre el test temporal real, con el mismo
+  criterio de honestidad de resultado que el resto del proyecto.
+- **Día a día** (seguimiento real) — acierto real en producción
+  (`predictions.actual_target_up_down`), no backtest, por versión de
+  modelo.
 
 Si el modelo cargado se entrenó antes de que `model.py` empezara a
 guardar las métricas junto al `.joblib`, la página de rendimiento lo
 avisa y pide reentrenar — vuelve a ejecutar `python src/model.py` una vez
 si ves ese aviso.
+
+"Resumen", "Noticias de la acción" y "Sentimiento del mercado" existen
+como archivos en `dashboard/views/` pero no están registrados en el v1
+(ver `dashboard/Inicio.py` y CONTEXTO.md, "Roadmap v1 (MVP para
+publicar)") — se recuperan añadiendo una línea si hace falta.
+
+### Demo publicada (datos congelados)
+
+La versión desplegada públicamente NO es un producto vivo: es una foto
+fija de la base de datos y los modelos en el momento de publicar, sin
+pipeline corriendo en la nube. El propio Dashboard avisa de hasta qué
+fecha llegan los datos ("Datos actualizados hasta...") — si esa fecha no
+avanza, es la demo, no la versión en vivo.
+
+Para reproducir esa demo en local (universo reducido a los tickers más
+relevantes en vez de los 208 completos, ~60MB en vez de ~254MB):
+
+```bash
+python src/export_demo_db.py                    # genera data/stocker_demo.db
+# copia a mano los .joblib de los 3 horizontes elegidos a models_demo/
+STOCKER_DB_PATH=data/stocker_demo.db STOCKER_MODELS_DIR=models_demo \
+    python -m streamlit run dashboard/Inicio.py
+```
+
+Sin esas dos variables de entorno, todo se comporta exactamente igual
+que siempre (`data/stocker.db` / `models/`, los 208 tickers).
 
 ## Estructura del repositorio
 
@@ -111,12 +149,14 @@ stocker_project/
 │   ├── processed/       # daily_prices: histórico limpio y tipado, + log de calidad
 │   └── gold/             # (referencia; las tablas gold viven en stocker.db, no en ficheros)
 ├── models/               # modelos entrenados versionados (*.joblib), gitignored
+├── models_demo/          # 3 modelos elegidos para la demo publicada — SÍ versionado, ver "Demo publicada"
 ├── src/                  # pipeline: descarga, limpieza, features, modelo, noticias (ver src/README.md)
 ├── dashboard/            # app Streamlit de solo lectura (ver dashboard/README.md)
 ├── notebooks/
 │   └── exploratory/      # notebooks exploratorios, no de producción
 ├── docs/
-│   └── entregas/          # entregas del curso (histórico de las decisiones de diseño)
+│   ├── entregas/          # entregas del curso (histórico de las decisiones de diseño)
+│   └── ROADMAP_MVP.md     # checklist accionable hacia la primera publicación
 ├── run_news_daily.bat     # tarea programable para src/news.py (ver src/README.md)
 ├── CONTEXTO.md            # diseño de referencia y bitácora de decisiones/incidentes reales
 ├── requirements.txt
@@ -126,7 +166,9 @@ stocker_project/
 `data/` y `models/` están vacíos en el repo (solo se versiona la
 estructura de carpetas): se regeneran desde la fuente ejecutando el
 pipeline — el repo lleva el código que produce los datos, no los datos en
-sí.
+sí. Única excepción: `data/stocker_demo.db` y `models_demo/` (ver "Demo
+publicada" arriba) SÍ se versionan — son la foto fija reducida que usa
+la versión publicada, no la base de datos real.
 
 ## Las capas de datos
 
@@ -159,16 +201,22 @@ Todavía no conectado como feature del modelo.
 
 ## Próximos pasos
 
-Ver la lista completa y priorizada en `CONTEXTO.md`, pero a grandes
-rasgos:
+Checklist accionable y priorizado hacia la primera publicación en
+[`docs/ROADMAP_MVP.md`](docs/ROADMAP_MVP.md); el porqué de cada decisión
+en `CONTEXTO.md`, "Roadmap v1 (MVP para publicar)". A grandes rasgos, lo
+que falta ahora mismo es desplegar la demo (crear cuenta en el hosting
+elegido, conectar el repo, publicar) — el código y los datos reducidos ya
+están listos.
 
-- Terminar el backfill de noticias (~2 años, se completa solo vía
-  `run_news_daily.bat`) y decidir cómo incorporar el sentimiento al
-  modelo.
-- Módulo que rellene `predictions.actual_target_up_down` con el cierre
-  real, para medir precisión real en producción (no solo backtest).
-- Entrenar modelos a horizonte semana/mes si se decide ampliar el
-  selector ya preparado en el dashboard.
+Fuera del v1, backlog explícito (no descartado, solo pospuesto):
+
+- Producto vivo con pipeline corriendo en la nube (la demo v1 es una foto
+  fija, no se actualiza sola).
+- Reincorporar "Resumen", "Noticias de la acción" y "Sentimiento del
+  mercado" a la navegación.
+- Universo completo de 208 tickers en la versión pública.
+- Sentimiento de noticias como feature real del modelo (investigado, sin
+  señal encontrada — ver CONTEXTO.md).
 - Limpieza pendiente de baja prioridad: filas huérfanas en `stocks`
   (tickers ya corregidos), tablas legacy `gold_aapl_train`/
   `gold_aapl_inference` sin eliminar físicamente.

@@ -117,6 +117,74 @@ def list_tickers(engine: Engine) -> list[str]:
     return [r[0] for r in rows]
 
 
+def ticker_logo_url(ticker: str, size: int = 48) -> str | None:
+    """URL del logo de la empresa vía la Logo API de Logo.dev (2026-08-28,
+    ver CONTEXTO.md "Logos de empresa en el dashboard") — parámetros
+    verificados contra la documentación oficial
+    (logo.dev/docs/logo-images/get), no adivinados:
+    - `format=png` + `theme=light`: el formato por defecto (`jpg`) no
+      tiene transparencia, así que el logo queda dentro de una caja
+      blanca — con PNG transparente y `theme=light`, los logos con
+      colores claros se invierten para seguir siendo visibles sobre el
+      fondo blanco del dashboard (ver "Tip" de la documentación oficial).
+    - `retina=true`: devuelve el doble de resolución real que `size`
+      (píxeles lógicos), para que no se vea borroso en pantallas de alta
+      densidad.
+    - `fallback` se deja en su valor por defecto (`monogram`): si
+      Logo.dev no tiene el logo de un ticker, devuelve un monograma en
+      vez de un error, así `st.image()` nunca muestra un icono de imagen
+      rota (Streamlit no tiene un `onerror` de HTML al que engancharse).
+
+    None si `LOGO_DEV_TOKEN` no está configurada — en ese caso el
+    dashboard simplemente no muestra logos, no rompe nada. El token es
+    una "publishable key" pensada para ir en una URL de `<img>` (no hace
+    falta protegerla como un secreto de servidor), pero se lee de
+    config/entorno igual que cualquier otra clave, nunca hardcodeada."""
+    from config import LOGO_DEV_TOKEN
+
+    if not LOGO_DEV_TOKEN:
+        return None
+    return (
+        f"https://img.logo.dev/ticker/{ticker}"
+        f"?token={LOGO_DEV_TOKEN}&size={size}&format=png&theme=light&retina=true"
+    )
+
+
+def default_ticker_index(tickers: list[str]) -> int:
+    """Índice a usar como valor por defecto de un selectbox de ticker.
+
+    Antes los tres selectores de ticker del dashboard usaban `index=0` a
+    secas sobre una lista ordenada ALFABÉTICAMENTE (`list_tickers()` /
+    `get_tickers_by_sector()`, ambas `ORDER BY ticker`) — eso hacía que
+    AAPL saliera seleccionado por defecto sin que nadie lo hubiera
+    decidido así, solo por ser el primero en orden alfabético (2026-08-28,
+    petición del usuario: NVDA como acción principal). Devuelve el índice
+    de `config.DEFAULT_TICKER` (NVDA, el primero de `config.TICKERS`) si
+    está en la lista dada; si no (p. ej. un filtro de sector que excluye a
+    NVDA), cae al primero de la lista, igual que antes."""
+    from config import DEFAULT_TICKER
+
+    if DEFAULT_TICKER in tickers:
+        return tickers.index(DEFAULT_TICKER)
+    return 0
+
+
+def get_latest_data_date(engine: Engine) -> dt.date | None:
+    """Fecha más reciente cargada en `daily_prices`, sobre TODOS los
+    tickers — para el aviso de "datos actualizados hasta" del Dashboard
+    (2026-08-27, ver CONTEXTO.md "Roadmap v1 (MVP para publicar)"): en
+    la demo publicada con datos congelados, esta fecha deja de avanzar
+    el día que se generó la foto (`data/stocker_demo.db`, ver
+    `src/export_demo_db.py`) — es la forma más honesta de que quien
+    visite la demo sepa que no es un dato en vivo, sin necesitar
+    detectar "modo demo" explícitamente en ningún sitio. None si
+    `daily_prices` está vacía (pipeline no ejecutado todavía)."""
+    from sqlalchemy import func
+
+    with engine.begin() as conn:
+        return conn.execute(select(func.max(dbmod.daily_prices.c.date))).scalar()
+
+
 def get_ticker_metadata(engine: Engine, ticker: str) -> dict:
     with engine.begin() as conn:
         row = conn.execute(select(dbmod.stocks).where(dbmod.stocks.c.ticker == ticker)).first()
@@ -334,6 +402,57 @@ def get_market_sentiment_daily(engine: Engine, months: int = 6) -> pd.DataFrame:
     df["sentimiento_medio"] = df["peso_sentimiento"] / df["n_articles"]
     cutoff = df["date"].max() - pd.DateOffset(months=months)
     return df.loc[df["date"] >= cutoff, ["date", "sentimiento_medio", "n_articles"]].reset_index(drop=True)
+
+
+def sentiment_scalar_label(score: float) -> str:
+    """Etiqueta en español de un score de sentimiento agregado (-1 a 1).
+    Pública (no `_sentiment_scalar_label`): la usan tanto
+    `get_market_sentiment_gauge` como las páginas que necesitan etiquetar
+    un tono medio propio (p. ej. el resumen dinámico de views/dashboard.py).
+    Mismos umbrales que `news._sentiment_label` (no se importa ese módulo
+    aquí a propósito — news.py es la capa de ingesta, data_access.py es
+    la capa de lectura del dashboard; 5 líneas de umbrales no justifican
+    acoplar los dos módulos). Si esos umbrales cambian en news.py, hay que
+    replicarlos aquí también."""
+    if score <= -0.35:
+        return SENTIMENT_LABEL_ES["Bearish"]
+    if score <= -0.15:
+        return SENTIMENT_LABEL_ES["Somewhat-Bearish"]
+    if score < 0.15:
+        return SENTIMENT_LABEL_ES["Neutral"]
+    if score < 0.35:
+        return SENTIMENT_LABEL_ES["Somewhat-Bullish"]
+    return SENTIMENT_LABEL_ES["Bullish"]
+
+
+def get_market_sentiment_gauge(engine: Engine, days: int = 7) -> dict | None:
+    """Sentimiento medio del MERCADO (todos los tickers a la vez) de los
+    últimos `days` días de calendario CON cobertura, condensado a un único
+    escalar. Se construyó originalmente para un medidor semicircular en
+    `views/dashboard.py` (2026-08-25), quitado el mismo día tras el
+    primer feedback del usuario (ver CONTEXTO.md, "Dashboard unificado
+    (mockup)") por ser la única pieza que no se recentraba en la acción
+    elegida — se deja esta función aquí, sin usar por ahora, por si hace
+    falta un resumen de sentimiento de mercado en otro sitio más
+    adelante. Reutiliza `get_market_sentiment_daily` (misma fuente
+    ponderada por nº de artículos) en vez de duplicar la consulta SQL:
+    solo colapsa la serie diaria a un escalar sobre la ventana reciente.
+    None si todavía no hay ninguna noticia guardada de ningún ticker."""
+    daily = get_market_sentiment_daily(engine, months=max(1, days // 20 + 1))
+    if daily.empty:
+        return None
+    cutoff = daily["date"].max() - pd.Timedelta(days=days)
+    reciente = daily[daily["date"] >= cutoff]
+    total_articulos = int(reciente["n_articles"].sum())
+    if reciente.empty or total_articulos == 0:
+        return None
+    sentimiento = float((reciente["sentimiento_medio"] * reciente["n_articles"]).sum() / total_articulos)
+    return {
+        "sentimiento": sentimiento,
+        "n_articles": total_articulos,
+        "n_dias": int(reciente["date"].nunique()),
+        "label": sentiment_scalar_label(sentimiento),
+    }
 
 
 def get_ticker_sentiment_ranking(engine: Engine, days: int = 7, min_articles: int = 3) -> pd.DataFrame:

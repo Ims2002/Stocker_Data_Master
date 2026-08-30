@@ -61,7 +61,7 @@ tickers_filtrados = (
     else [t for t in tickers if t in set(meta_tickers.loc[meta_tickers["sector"] == sector, "ticker"])]
 ) or tickers
 with col_a:
-    ticker = st.selectbox("Ticker", tickers_filtrados, index=0)
+    ticker = st.selectbox("Ticker", tickers_filtrados, index=da.default_ticker_index(tickers_filtrados))
 with col_b:
     horizonte_label = st.segmented_control(
         "Horizonte de predicción", list(HORIZON_LABELS.values()), default=HORIZON_LABELS[1],
@@ -75,10 +75,16 @@ horizon = _LABEL_TO_HORIZON[horizonte_label]
 target_col = "target_up_down" if horizon == 1 else f"target_up_down_{horizon}d"
 
 meta = da.get_ticker_metadata(engine, ticker)
-st.caption(
-    f"**{meta.get('nombre') or ticker}** · {meta.get('sector') or 'sector desconocido'} · "
-    f"{meta.get('pais') or 'país desconocido'}"
-)
+logo_url = da.ticker_logo_url(ticker, size=40)
+col_logo, col_meta = st.columns([1, 11])
+if logo_url:
+    with col_logo:
+        st.image(logo_url, width=40)
+with col_meta:
+    st.caption(
+        f"**{meta.get('nombre') or ticker}** · {meta.get('sector') or 'sector desconocido'} · "
+        f"{meta.get('pais') or 'país desconocido'}"
+    )
 
 try:
     bundle = _model_bundle(horizon)

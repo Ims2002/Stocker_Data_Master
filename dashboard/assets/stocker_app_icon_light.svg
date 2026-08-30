@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200">
+  <rect x="0" y="0" width="200" height="200" rx="44" fill="#ffffff"/>
+  <g transform="translate(42,34) scale(1.16)">
+    <rect x="4" y="0" width="24" height="100" fill="#0f172a"/>
+    <polyline points="28,50 40,38 48,44 60,24 68,30 82,12 94,8"
+      fill="none" stroke="#16a34a" stroke-width="15" stroke-linecap="round" stroke-linejoin="round"/>
+    <circle cx="40" cy="38" r="4.5" fill="#16a34a"/>
+    <circle cx="48" cy="44" r="4.5" fill="#16a34a"/>
+    <circle cx="60" cy="24" r="4.5" fill="#16a34a"/>
+    <circle cx="68" cy="30" r="4.5" fill="#16a34a"/>
+    <circle cx="94" cy="8" r="7" fill="#16a34a" stroke="#ffffff" stroke-width="2.5"/>
+    <polyline points="28,50 40,62 48,56 60,76 68,70 82,88 94,92"
+      fill="none" stroke="#dc2626" stroke-width="15" stroke-linecap="round" stroke-linejoin="round"/>
+    <circle cx="40" cy="62" r="4.5" fill="#dc2626"/>
+    <circle cx="48" cy="56" r="4.5" fill="#dc2626"/>
+    <circle cx="60" cy="76" r="4.5" fill="#dc2626"/>
+    <circle cx="68" cy="70" r="4.5" fill="#dc2626"/>
+    <circle cx="94" cy="92" r="7" fill="#dc2626" stroke="#ffffff" stroke-width="2.5"/>
+  </g>
+</svg>

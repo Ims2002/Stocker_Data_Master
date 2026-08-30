@@ -429,3 +429,526 @@ El usuario, tras revisar una lista de posibles KPIs adicionales, pidió incorpor
 **Filtro por sector** (`views/predicciones.py`, `views/sentimiento_por_accion.py`): selector "Sector" (`stocks.sector`, vía `get_tickers_by_sector`) que filtra la lista de tickers del selector "Ticker" — "Todos" por defecto, sin romper el comportamiento existente. No se ha tocado ninguna otra pestaña (importancia de features y rendimiento del modelo son globales, no por ticker; día a día filtra por `model_version`, no por ticker).
 
 Probado con `AppTest` contra la base de datos real: las siete páginas cargan sin excepciones, incluyendo cambiar el sector en "Predicciones" (verificado que el selector de ticker se actualiza a solo los tickers de ese sector) y mover el slider de confianza en "Resumen".
+
+## Disparador adicional en Task Scheduler: al iniciar sesión (2026-08-19)
+
+El usuario preguntó si podía hacer que `Stocker_Noticias_Diarias`/`Stocker_Pipeline_Diario` se ejecutaran cada vez que enciende el portátil, no solo a la hora fija programada. Fuera del alcance de esta herramienta (no hay acceso al Task Scheduler real del usuario desde aquí) — se le dieron los comandos de PowerShell exactos para que los ejecute él (ver `src/README.md`, "Disparador adicional: ejecutar también al iniciar sesión"). Decisión, tras preguntar explícitamente: **añadir** el disparador "al iniciar sesión" (con 2 min de margen) a las dos tareas, sin quitar el de hora fija — más robusto que sustituirlo por completo, porque si el usuario deja el portátil encendido varios días sin reiniciar sesión, la hora fija sigue cubriendo esa ejecución diaria.
+
+**Confirmado en la máquina real del usuario**: `Get-ScheduledTask ... | Select -ExpandProperty Triggers` sobre las dos tareas muestra el `CalendarTrigger` original (`DaysInterval: 1`) más un `LogonTrigger` nuevo (`Delay: PT2M`) en cada una — el PowerShell se ejecutó sin errores y quedó tal como se diseñó.
+
+## Prioridad de noticias para tickers relevantes (2026-08-25)
+
+Petición del usuario: que las acciones "más relevantes del mercado" (una
+muestra de entre 25 y 100) se actualicen en `news.py` con más frecuencia
+que el resto, en vez de quedar sujetas solo al muestreo aleatorio uniforme
+de `run_daily_update()` (ver "Rediseño de noticias: 1 ticker por
+llamada" más abajo) — que da a cada uno de los 208 tickers la misma
+probabilidad, ~1 revisión cada 8-9 días de media.
+
+**Señal de relevancia usada**: no existe ningún campo de capitalización
+bursátil en `stocks` para ordenar "de verdad" por tamaño de mercado, y no
+se quiso meter una fuente de datos nueva solo para esto. Se reutiliza el
+orden ya existente de `config.TICKERS`, que el propio usuario dejó
+empezando por los mega-caps (NVDA, AAPL, MSFT, AMZN, GOOGL, GOOG, AVGO,
+META, TSLA, LLY...) — los primeros `NEWS_PRIORITY_TICKERS_COUNT` (50,
+punto intermedio del rango 25-100 pedido) pasan a ser
+`config.NEWS_PRIORITY_TICKERS`.
+
+**Mecanismo**: dentro de `NEWS_DAILY_CALL_BUDGET` (25/día, límite del free
+tier de Alpha Vantage — el presupuesto TOTAL no cambia, solo se reparte
+distinto), `NEWS_PRIORITY_DAILY_SHARE=0.8` (20 llamadas/día) se reserva
+para recorrer `NEWS_PRIORITY_TICKERS` en **ronda determinista** — sin
+tabla de cursor nueva: el offset del día sale de
+`date.today().toordinal()` (un entero que ya avanza uno por día de
+calendario), así que el ciclo completo de los 50 tarda
+`ceil(50/20) = 3` días, sin saltos ni repeticiones antes de completar la
+vuelta. Verificado con un script que simula 4 días consecutivos
+(monkeypatchando `fetch_news_batch`/`dt.date.today`): los lotes
+prioritarios cubren exactamente 0-49 en 3 días (día 0: lotes 10-29, día
+1: 30-49, día 2: 0-19 con wrap) antes de repetir. Las 5 llamadas
+restantes del presupuesto siguen el muestreo aleatorio de siempre, pero
+ahora solo sobre los tickers NO prioritarios.
+
+**Trade-off real y aceptado, no escondido**: como el presupuesto total no
+cambia, priorizar a unos implica desatender más a los otros. Los 158
+tickers no prioritarios pasan de revisarse cada ~8-9 días de media a cada
+~30 días (158/5). Se acepta porque el usuario pidió explícitamente
+priorizar relevancia sobre cobertura uniforme — si en el futuro hace
+falta más cobertura general, la palanca es `NEWS_PRIORITY_DAILY_SHARE`
+(baja el share) o `NEWS_PRIORITY_TICKERS_COUNT` (baja el tamaño del set
+prioritario), ambas en `config.py`.
+
+Cambios: `config.py` (`NEWS_PRIORITY_TICKERS_COUNT`,
+`NEWS_PRIORITY_TICKERS`, `NEWS_PRIORITY_DAILY_SHARE`) y
+`news.run_daily_update()` reescrita para partir el presupuesto y añadir
+la etiqueta prioritario/aleatorio en los logs. `run_backfill()` no se
+toca — el backfill histórico ya recorre los 208 tickers por orden, sin
+distinción de prioridad, porque es un proceso de una sola vez.
+
+## Dashboard unificado (mockup) (2026-08-19 → implementado 2026-08-25)
+
+Tras los 5 KPIs nuevos añadidos a "Resumen" (ver más arriba), el usuario
+pidió un mockup visual de estilo SaaS (compartió dos capturas de
+referencia: un dashboard operativo de atención al cliente y un informe
+ejecutivo comercial, ambos con tarjetas de KPI + gráficos + paneles de
+alertas/insights) antes de escribir código. Iterado dos veces con
+`mcp__visualize__show_widget` hasta aprobar: barra lateral de filtros,
+texto dinámico según selección, tabla de noticias de una línea por
+acción con color de sentimiento, y un medidor en semicírculo con el
+sentimiento GENERAL del mercado (de TODAS las acciones, no filtrado).
+
+**Decisiones de alcance, preguntadas explícitamente antes de tocar
+código (2026-08-25)**:
+- Página **nueva y separada** ("Dashboard"), no sustituye a "Resumen" —
+  las dos conviven; "Resumen" sigue siendo la lista de KPIs por sección,
+  "Dashboard" es la reinterpretación visual recentrada en una acción.
+- El selector de acción de la barra lateral **recoloca TODO el
+  dashboard** (KPIs de cabecera, gráfico, noticias, texto de insights),
+  no solo la tabla de noticias — con el matiz de que el medidor de
+  sentimiento del mercado se queda siempre global (petición explícita
+  del usuario: "de TODAS las acciones").
+- Las páginas de detalle existentes (Predicciones, Día a día, ¿Funciona
+  de verdad?, En qué se fija, Noticias de la acción, Sentimiento del
+  mercado) **se mantienen intactas**, enlazadas desde el pie de
+  "Dashboard" (`st.page_link`) — mismo patrón que ya usaba "Resumen".
+- Horizonte: **uno a la vez con selector** (día/semana/mes), igual que
+  "Predicciones", no los tres en paralelo.
+- Responsividad: no hay CSS a mano para móvil — se apoya en que
+  `st.columns` de Streamlit ya apila verticalmente en pantallas
+  estrechas de forma nativa; se mantuvieron como mucho 4 columnas por
+  fila para que ese apilado se lea bien.
+
+**Piezas nuevas**:
+- `dashboard/views/dashboard.py` (nuevo) — KPIs de cabecera (predicción,
+  probabilidad, último cierre + variación, acierto del backtest oficial)
+  recentrados en la acción elegida; gráfico de precio con aciertos/fallos
+  del backtest + predicción destacada (misma lógica que "Predicciones",
+  condensada); medidor de sentimiento del mercado; tabla de noticias de
+  una línea por acción (título/fuente-fecha/pill de sentimiento, HTML
+  escapado con `html.escape` porque los títulos vienen de Alpha Vantage,
+  fuente externa); párrafo de "Lectura rápida" con texto generado a
+  partir de los mismos datos (predicción, acierto, tono de noticias de
+  la acción, ambiente general del mercado); enlaces a las páginas de
+  detalle.
+- `data_access.get_market_sentiment_gauge(engine, days=7)` (nuevo) —
+  colapsa `get_market_sentiment_daily` (ya existente) a un único escalar
+  ponderado sobre los últimos 7 días de calendario con cobertura, para
+  alimentar el medidor. `data_access.sentiment_scalar_label(score)`
+  (nuevo, pública) — mismos umbrales que `news._sentiment_label` mapeados
+  a español; se duplica a propósito en vez de importar `news.py` desde
+  `data_access.py` (capas de ingesta y lectura deliberadamente
+  desacopladas) — si esos umbrales cambian en `news.py`, hay que
+  replicarlos aquí también.
+- Medidor semicircular construido a mano en SVG (`_sentiment_gauge_svg`
+  dentro de `views/dashboard.py`), no con `go.Indicator` de Plotly — el
+  gauge nativo de Plotly no da un semicírculo real (siempre un arco de
+  ~270°), y el mockup aprobado pedía la forma exacta de semicírculo con
+  degradado rojo→gris→verde y aguja.
+
+**Verificado** con `streamlit.testing.v1.AppTest` contra la base de datos
+real: cargando la app completa desde `Inicio.py` y navegando con
+`switch_page("views/dashboard.py")` (necesario para que `st.page_link`
+resuelva las rutas — probarlo con `AppTest.from_file()` directo sobre el
+archivo de la vista falla con `KeyError: 'url_pathname'`, error del
+arnés de pruebas al faltar el contexto de navegación completo, no un bug
+real). Probado: cambio de sector, cambio de ticker (incluidos varios sin
+mucha cobertura de noticias), los tres horizontes, extremos del slider de
+meses — sin excepciones; el SVG del medidor y la tabla HTML de noticias
+aparecen renderizados en la salida.
+
+**Recortado el mismo día, tras el primer feedback del usuario sobre el
+boceto**: "no me disgusta, eso sí... elimina la Tendencia del mercado y
+el enlace y todo su apartado respectivo de ¿Funciona de verdad?". Se
+quitaron dos piezas completas de `views/dashboard.py`:
+- El medidor de sentimiento general del mercado (sección, función
+  `_sentiment_gauge_svg`, la consulta `_market_gauge()` y su mención en
+  el enlace de pie de página "Sentimiento del mercado →" y en el párrafo
+  de "Lectura rápida"). Motivo, con sentido más allá de "el usuario lo
+  pidió": era la única pieza del dashboard que NO se recentraba en la
+  acción elegida, rompía la idea central de la página.
+- El KPI "Acierto del modelo (test oficial)" de la cabecera, su frase en
+  "Lectura rápida" y el enlace de pie de página "¿Funciona de verdad?
+  →" — quedaba redundante con esa página dedicada (sigue accesible desde
+  la navegación superior de siempre, solo se quitó el atajo duplicado
+  desde Dashboard). El gráfico de precio conserva los marcadores de
+  acierto/fallo del backtest — solo se quitó el número agregado y el
+  texto que lo repetía.
+
+La fila de KPIs de cabecera pasa de 4 a 3 columnas (Predicción,
+Probabilidad, Último cierre) y el bloque de noticias pasa a ocupar el
+ancho completo (antes compartía fila con el medidor). El pie de página
+se queda con 2 enlaces (Predicciones, Noticias de la acción) en vez de
+4. Reverificado con `AppTest` tras el recorte: 3 métricas, 2
+`page_link`, sin excepciones en los tres horizontes ni al cambiar de
+ticker/sector.
+
+## Roadmap v1 (MVP para publicar) (2026-08-27)
+
+El usuario quiere encarar el proyecto hacia un "producto mínimo viable"
+publicable en un plazo corto, y pidió analizar el proyecto, quitar
+pestañas sin valor para una v1, y un roadmap de lo que falta. Dado que
+"publicar" es ambiguo (¿desplegado en internet? ¿solo repo pulido?) y
+que decidir qué se queda fuera de una primera versión es una decisión de
+producto de peso, se preguntó explícitamente antes de tocar nada — el
+usuario acababa de pedir precisamente eso: "SIEMPRE ante cualquier duda
+[...] pregúntame [...] antes de que se hagan más grandes en un futuro"
+(guardado en memoria del agente, no solo aquí).
+
+**Decisiones confirmadas por el usuario (2026-08-27)**:
+- **Qué significa "publicar"**: demo desplegada con **datos congelados**
+  (una foto de la base de datos en el momento de publicar, sin
+  actualización automática en la nube) — no un producto vivo con
+  pipeline corriendo en la nube a diario. Eso simplifica mucho el
+  alcance: no hace falta resolver scheduling en la nube ni exponer
+  `ALPHA_VANTAGE_API_KEY` en el despliegue (el dashboard es de solo
+  lectura sobre `stocker.db`/`models/`, nunca llama a ninguna API en
+  tiempo real — verificado revisando `data_access.py`, no importa
+  `requests` ni nada de `news.py`).
+- **"Resumen" fuera de la navegación del v1**: `views/dashboard.py` pasa
+  a ser la página de entrada (`default=True`); `views/inicio.py` se
+  queda como archivo sin registrar en `Inicio.py` (no se borra, se
+  recupera con una línea si hace falta en el futuro).
+- **"Noticias de la acción" y "Sentimiento del mercado" fuera del v1**:
+  dependen del backfill de Alpha Vantage (~9 días desde cero por el
+  límite gratuito de 25 llamadas/día) y CONTEXTO.md ya documenta que esa
+  señal no ayuda a predecir el precio — no sostienen el valor central
+  del proyecto. Mismo tratamiento: archivos intactos, solo
+  desregistrados de `Inicio.py`.
+- **Plazo**: "esta semana" — roadmap deliberadamente ajustado, se
+  posponen pulidos no críticos.
+
+**Navegación del v1 resultante** (`dashboard/Inicio.py`, 5 páginas):
+Dashboard (entrada) → Predicciones → En qué se fija → ¿Funciona de
+verdad? → Día a día. Verificado con `AppTest`: las 5 cargan sin
+excepción, `Dashboard` es la página por defecto, y su enlace de pie de
+página a "Predicciones" resuelve bien (el enlace a "Noticias de la
+acción" se quitó de `views/dashboard.py` porque `st.page_link` no
+resuelve una página no registrada).
+
+**Hallazgo clave de la investigación, con impacto directo en el
+roadmap**: `data/stocker.db` pesa 254MB y `models/` 55MB — ninguno de
+los dos se versiona en git (`.gitignore` los excluye) y además 254MB
+supera el límite de 100MB por archivo de GitHub, así que ni siquiera
+cabría en un repo normal aunque se quisiera. Para una demo desplegada
+con datos congelados, hay que decidir CÓMO viajan esos ~309MB hasta el
+sitio donde se aloje la app — esto todavía no está resuelto, es la
+pieza central pendiente del roadmap (ver `docs/ROADMAP_MVP.md` para el
+detalle y las opciones planteadas al usuario).
+
+**Decisión sobre el alojamiento de los datos (2026-08-27)**: en vez de
+Git LFS o descarga externa, se recorta el universo de tickers para que
+la base de datos quepa directamente en un repo normal de GitHub. Se
+reutiliza `config.NEWS_PRIORITY_TICKERS` (los 50 tickers más relevantes,
+ya definidos para la rotación prioritaria de noticias, ver "Prioridad de
+noticias para tickers relevantes") como el subconjunto de la demo — no
+se inventa un criterio de relevancia nuevo. Estimado a partir de filas
+reales (daily_prices: 2497 filas/ticker de media, gold_train: 2463,
+news_articles: 932): con 50 tickers la base de datos de la demo pesaría
+~60MB (254MB / 208 × 50), muy por debajo del límite de 100MB de GitHub.
+Los modelos NO necesitan recortarse ni reentrenarse: no usan el ticker
+como feature (ver `model.py`), así que los `.joblib` ya entrenados sobre
+el universo completo (~6-7MB cada uno) sirven igual para predecir sobre
+el subconjunto de la demo.
+
+El roadmap completo, accionable y con checkboxes vive en
+[`docs/ROADMAP_MVP.md`](docs/ROADMAP_MVP.md) — no se duplica aquí para
+no tener dos fuentes de verdad; este apartado es el resumen de las
+decisiones y su porqué.
+
+**Fase 1 completada (2026-08-27)**: `src/export_demo_db.py` (nuevo) copia
+`stocks`/`daily_prices`/`gold_train`/`gold_inference`/`predictions`/
+`news_articles` de `data/stocker.db` filtrando por
+`NEWS_PRIORITY_TICKERS`, a `data/stocker_demo.db`. Bug real encontrado y
+corregido durante la verificación: la primera versión usaba
+`metadata.create_all(dst_engine, tables=_TABLES)`, que crea tablas físicas
+pero NO la vista `news_sentiment_daily` (SQL crudo, fuera de `metadata`)
+— `AppTest` contra la base generada falló con `OperationalError: no such
+table: news_sentiment_daily` en cuanto el Dashboard intentó leer
+sentimiento de noticias. Corregido usando `dbmod.init_db(dst_engine)`
+(crea todo el esquema real, incluida la vista) en vez de un
+`create_all` parcial. Ejecutado contra la base real: 61.0MB para 50
+tickers (daily_prices: 123.658 filas, gold_train: 121.958, predictions:
+750, news_articles: 49.381) — dentro de lo estimado.
+
+`config.DB_PATH`/`config.MODELS_DIR` ahora aceptan override por
+`STOCKER_DB_PATH`/`STOCKER_MODELS_DIR` (si no están definidas, idéntico
+comportamiento de siempre — ningún `.bat` programado se entera del
+cambio). Los 3 `.joblib` elegidos para la demo (horizonte día:
+`random_forest_20260810181458`, semana: `random_forest_h5_20260826165001`,
+mes: `random_forest_h20_20260826165119` — los más recientes de cada
+horizonte en el momento de publicar) se copiaron literalmente a
+`models_demo/` sin reentrenar: el modelo no usa el ticker como feature,
+así que sirve igual sobre el subconjunto de 50 tickers que sobre los 208.
+
+`.gitignore` gana dos excepciones puntuales (`!data/stocker_demo.db`,
+`!/models_demo/` + `!/models_demo/*.joblib`) sin afectar a `data/stocker.db`
+ni a `/models/`, que se siguen ignorando — verificado con `git add -n`
+(los 4 ficheros de la demo se añadirían; la base real y `models/` no).
+
+Dashboard gana un aviso "Datos actualizados hasta: {fecha}" (nueva
+`data_access.get_latest_data_date()`, máximo de `daily_prices.date`) — es
+la señal honesta de que la demo publicada es una foto fija: si esa fecha
+deja de avanzar, no es la versión en vivo. No hace falta detectar "modo
+demo" en ningún sitio, la propia fecha ya lo comunica.
+
+**Quitado el 2026-08-28**: el usuario pidió eliminar este aviso del
+Dashboard. `data_access.get_latest_data_date()` se deja tal cual (no se
+usa en ningún sitio ahora mismo, pero no molesta) por si se quiere volver
+a mostrar en el futuro — solo se quitó la llamada y el `st.caption` de
+`views/dashboard.py`.
+
+Todo verificado con `AppTest` en dos configuraciones: contra
+`data/stocker.db`/`models/` reales (sin variables de entorno) y contra
+`data/stocker_demo.db`/`models_demo/` (con `STOCKER_DB_PATH`/
+`STOCKER_MODELS_DIR`) — 5 páginas cargan sin excepción en ambos casos,
+selector de ticker con 50 opciones en la demo, los tres horizontes
+funcionan.
+
+Pendiente (Fase 1, acciones que requieren cuentas/decisiones del
+usuario, no ejecutables desde aquí): confirmar plataforma de despliegue
+(asumido Streamlit Community Cloud), público/privado del repo, y el
+`git add`/`commit`/`push` real de `stocker_demo.db` + `models_demo/` —
+deliberadamente no automatizado, publica contenido en su GitHub.
+
+## Experimento: modelo de un solo ticker vs. pooled (2026-08-28)
+
+El usuario preguntó cómo se entrena el modelo real (pooled vs. por
+ticker) y pidió una prueba pequeña: entrenar SOLO con el histórico de
+NVDA y comparar. Script `src/experiment_single_ticker.py` (BORRADO el
+2026-08-28, mismo día que se escribió — el usuario pidió eliminar la
+versión de desarrollo una vez respondida la pregunta; no dejaba ningún
+artefacto persistente, así que borrarlo no afecta a nada en producción,
+ver más abajo) — deliberadamente NO tocaba `models/` (no guardaba
+`.joblib`, contaminaría `predict.latest_model_path()`) ni `predictions`
+(no persistía nada en la base de datos): era un experimento de
+comparación, no una alternativa de
+producción. Reutilizaba `model.train_and_evaluate`/`build_feature_matrix`/
+`print_report` tal cual para que la comparación fuera justa (mismas
+features, mismo criterio de split, mismos baselines).
+
+Además de entrenar y evaluar el modelo de un solo ticker, evaluaba
+también el modelo pooled ya entrenado sobre las MISMAS filas de test de
+ese ticker (mismo periodo, mismo target) — comparación sobre exactamente
+las mismas filas, no dos test sets distintos.
+
+**Bug real encontrado y corregido al verificarlo**: `df["date"]` de
+`gold_train` son objetos `datetime.date` (tal cual los devuelve
+sqlite3), no `pd.Timestamp` — comparar con un `pd.Timestamp` construido
+a mano lanza `TypeError: Cannot compare Timestamp with datetime.date`.
+Corregido usando `dt.date.fromisoformat(...)` en vez de `pd.Timestamp(...)`
+para el corte de fecha.
+
+**Resultado real, horizonte día, NVDA** (126 filas de test,
+2026-02-27 a 2026-08-27): el modelo de SOLO NVDA (2.502 filas propias)
+obtiene acc=0.516 sobre sus propias 126 filas de test; el modelo POOLED
+(entrenado con 512.958 filas de 208 tickers) obtiene acc=0.444 sobre
+esas MISMAS 126 filas. En esta ventana concreta, el modelo aislado le
+gana al pooled en el propio terreno de NVDA — aunque ninguno de los dos
+supera de forma consistente a los baselines (mayoritario 0.508,
+persistencia 0.524), y la muestra es pequeña (126 filas) para sacar una
+conclusión fuerte. Resultado real, reportado tal cual, no una prueba
+definitiva de que "un modelo por ticker es mejor" — haría falta repetir
+en varios tickers y ventanas para confirmar el patrón (no hecho todavía,
+fuera del alcance de "una prueba pequeña").
+
+## NVDA como acción principal por defecto (2026-08-28)
+
+Los tres selectores de ticker del dashboard (`views/dashboard.py`,
+`views/predicciones.py`, `views/sentimiento_por_accion.py`) usaban
+`index=0` a secas sobre listas ordenadas ALFABÉTICAMENTE
+(`list_tickers()`/`get_tickers_by_sector()`, ambas `ORDER BY ticker`) —
+por eso salía AAPL seleccionado por defecto, sin que nadie lo hubiera
+decidido así, solo por ser el primero en orden alfabético.
+`config.TICKERS` ya empezaba por NVDA (y `config.DEFAULT_TICKER =
+TICKERS[0]` ya era NVDA), pero eso nunca llegó a los selectores del
+dashboard porque leen de `daily_prices`/`stocks` vía SQL ordenado, no de
+la lista de config.
+
+Nueva función `data_access.default_ticker_index(tickers)`: devuelve el
+índice de `config.DEFAULT_TICKER` si está en la lista dada, si no cae al
+primero (mismo comportamiento que antes cuando un filtro de sector
+excluye a NVDA). Reutilizada en los tres selectores en vez de duplicar la
+lógica. Verificado con `AppTest`: "Dashboard" y "Predicciones" arrancan
+con NVDA seleccionado.
+
+## Logos de empresa en el dashboard (2026-08-28)
+
+Petición del usuario: hacer el dashboard más visual incorporando el logo
+de cada ticker. Investigado antes de tocar código (información
+"presente", no del entrenamiento — verificado con búsqueda web): la
+opción obvia hace un tiempo, Clearbit Logo API, **cerró el 8 de
+diciembre de 2025** — las peticiones a `logo.clearbit.com` ya no
+funcionan. El propio equipo de Clearbit/HubSpot recomienda **Logo.dev**
+como sucesor oficial (mismo equipo, migración directa).
+
+Opciones evaluadas y presentadas al usuario:
+- **Logo.dev** (elegida): busca logo directamente por ticker
+  (`img.logo.dev/ticker/{TICKER}?token=...`), 70.000+ tickers en 60+
+  mercados, capa gratuita de 500K peticiones/mes. Requiere crear una
+  cuenta gratuita (sin tarjeta) para conseguir un "publishable key".
+- **AllInvestView Ticker Logos** (descartada): sin cuenta ni clave, pero
+  exige un enlace de atribución visible ("Logos by AllInvestView") en
+  el dashboard y funciona por DOMINIO de empresa, no por ticker
+  directamente (habría que guardar el dominio de cada ticker, p. ej.
+  ampliando `enrich_stocks.py` con `Ticker.info['website']`).
+
+El usuario prefirió explícitamente crear una cuenta antes que mostrar
+una atribución de terceros en su proyecto de máster.
+
+**Implementación**: `config.LOGO_DEV_TOKEN` (env var, `.env.example`
+actualizado) — es una "publishable key" pensada para ir en una URL de
+`<img>`, no un secreto de servidor, pero se lee de config igual que
+`ALPHA_VANTAGE_API_KEY`, nunca hardcodeada. Nueva
+`data_access.ticker_logo_url(ticker)`: devuelve la URL o `None` si no
+hay token configurado — SIN token, el dashboard funciona exactamente
+igual que antes, simplemente sin logos (no rompe nada, no hace falta que
+el usuario configure esto para poder seguir trabajando). Logo mostrado
+en la cabecera de "Dashboard" (48px) y "Predicciones" (40px), junto al
+nombre de la empresa — las otras páginas no lo llevan, según lo pedido.
+
+Verificado con `AppTest` en dos configuraciones: sin `LOGO_DEV_TOKEN`
+(camino por defecto, sin excepción, sin imagen) y con un token de
+prueba (`st.image` se renderiza sin excepción — la validación de que la
+imagen REAL carga bien depende del token real del usuario, no
+verificable desde aquí).
+
+**Actualizado el mismo día** — el usuario ya creó la cuenta y pegó el
+prompt de configuración oficial de Logo.dev (con su publishable key
+real). Se verificó contra la documentación oficial
+(`logo.dev/docs/logo-images/get`, fetch real, no de memoria) el esquema
+exacto de parámetros — la construcción de URL que ya existía
+(`img.logo.dev/ticker/{TICKER}?token=...`) era correcta, pero se
+amplió con los parámetros documentados que mejoran la calidad visual:
+- `format=png` + `theme=light`: el formato por defecto (`jpg`) no tiene
+  transparencia (el logo queda en una caja blanca); con PNG transparente
+  + `theme=light`, los logos claros se invierten para seguir siendo
+  visibles sobre el fondo blanco del dashboard (tip explícito de la
+  documentación oficial).
+- `retina=true`: doble resolución real para pantallas de alta densidad.
+- `fallback` se deja en su valor por defecto (`monogram`, no `404`): si
+  Logo.dev no tiene el logo de un ticker, devuelve un monograma en vez
+  de fallar — así `st.image()` nunca muestra un icono de imagen rota
+  (Streamlit no tiene un `onerror` de HTML al que engancharse).
+
+`data_access.ticker_logo_url(ticker, size=48)` ahora acepta `size`
+explícito (Dashboard pide 48, Predicciones 40, coincidiendo con el
+ancho real del `st.image()` de cada página). El token real ya está en
+`.env` local (no en `.env.example`, que sigue sin secretos) y en
+`config.LOGO_DEV_TOKEN`. Verificado con `AppTest` cargando el `.env`
+real: ambas páginas renderizan sin excepción con la imagen presente.
+Pendiente del usuario: añadir la misma variable a los "Secrets" de la
+plataforma de despliegue cuando publique la demo.
+
+## Cabecera de marca en Dashboard (2026-08-28)
+
+Petición del usuario: quitar el `st.title("Dashboard")` de la página de
+entrada y sustituirlo por una cabecera de marca — "STOCKER" arriba a la
+izquierda, con subtítulo dinámico debajo (logo del ticker + nombre de la
+empresa + `#TICKER`, en gris claro).
+
+Cambios en `dashboard/views/dashboard.py`:
+- Se quitó `st.title("Dashboard")` y su caption descriptiva de debajo
+  (eran redundantes con la pestaña de navegación, que ya dice
+  "Dashboard").
+- El antiguo bloque de cabecera del ticker (columnas con logo + `###
+  Nombre · \`TICKER\``) se sustituyó por: `st.title("STOCKER")` seguido
+  de un bloque HTML (`st.markdown(..., unsafe_allow_html=True)`, mismo
+  patrón ya usado en la tabla de noticias de esta página) con el logo
+  (`<img>`, 26px) y un `<span>` en `color:#9CA3AF` (el mismo gris que ya
+  se usaba para "Neutral" en el sentimiento) con el nombre de la empresa
+  y `#TICKER` en negrita — p. ej. "Nvidia Corporation · **#NVDA**".
+- Como el subtítulo depende del ticker elegido en la barra lateral, la
+  cabecera ahora se pinta DESPUÉS de leer la selección de la barra
+  lateral, no antes — se movió el bloque de título de la parte de arriba
+  del script a justo después de `meta = da.get_ticker_metadata(...)`.
+- El caption de sector/país y el aviso de fecha de datos (demo
+  congelada) se conservan intactos, ahora justo debajo del subtítulo.
+- `html.escape()` se sigue aplicando al nombre de la empresa antes de
+  inyectarlo en el HTML (mismo cuidado que ya se aplicaba en la tabla de
+  noticias).
+
+No se tocó `views/predicciones.py` — esta petición nombraba
+específicamente "al entrar al dashboard", así que su cabecera (logo +
+caption de una línea) se dejó como estaba.
+
+Verificado con `AppTest` contra la base de datos real: sin excepciones,
+`at.title[0].value == "STOCKER"`, el bloque markdown con el logo/nombre/
+`#NVDA` presente, y el orden de captions correcto (sector/país → fecha
+de datos → resto de la página).
+
+**Actualizado el mismo día**: el `st.title("STOCKER")` se volvió a
+quitar — el usuario pidió eliminarlo por redundante con el wordmark
+"Stocker" de la barra de navegación (`ui.render_logo()`). La cabecera de
+Dashboard quedó solo con el subtítulo dinámico (logo + nombre + ticker).
+
+## Experimento de un solo ticker: eliminado (2026-08-28)
+
+El usuario pidió borrar `src/experiment_single_ticker.py` una vez
+respondida la pregunta que lo motivó (ver sección de arriba). No dejaba
+ningún artefacto persistente (no `.joblib`, no filas en `predictions`),
+así que borrarlo no afecta a nada en producción — solo se pierde el
+script en sí; el resultado y el bug encontrado quedan documentados en la
+sección de arriba para no perder el conocimiento.
+
+## Identidad de marca: logos del artifact de claude.ai (2026-08-28)
+
+El usuario compartió un artifact de claude.ai (`claude.ai/code/artifact/
+856fecea-...`) con el logo real de Stocker — no pude abrirlo directamente
+(la extensión Claude in Chrome no estaba conectada en esta sesión, y el
+fetch normal de esa URL solo devuelve la carcasa vacía sin el contenido,
+que se carga por JavaScript), así que el usuario subió los 4 ficheros
+generados por ese artifact directamente:
+- `stocker-k-icon.svg` — icono suelto: una "K" donde el trazo diagonal es
+  un gráfico de líneas con dos tramos (verde ascendente, rojo
+  descendente, con puntos marcando "sesiones"), fondo transparente.
+- `stocker-wordmark.html` — "STOCKER" completo con el icono sustituyendo
+  la letra K, tipografía Space Grotesk (Google Fonts) en negrita.
+- `stocker-app-icon-dark.svg` / `stocker-app-icon-light.svg` — el mismo
+  icono dentro de un cuadrado redondeado (200×200), en dos variantes de
+  fondo (`dark` = fondo azul marino `#0f172a`, pensada para tabs/fondos
+  claros; `light` = fondo blanco, pensada para fondos oscuros).
+
+Petición del usuario: "usa estos artifacts para usar los logos como
+imagen de marca en toda la app". Decisiones tomadas:
+
+1. **Los 4 SVG originales se guardaron tal cual** en el nuevo directorio
+   `dashboard/assets/` (más el HTML del wordmark, sin usar, solo de
+   referencia) — no se modificó ningún path ni color de los que trajo el
+   usuario.
+2. **El wordmark NO se pudo usar tal cual** porque depende de Space
+   Grotesk vía `<link>` a Google Fonts, y `st.logo()` de Streamlit pinta
+   una imagen (SVG o raster), no ejecuta HTML/CSS — un `@font-face`
+   externo dentro de un SVG usado como imagen no es fiable entre
+   navegadores. Tampoco se pudo descargar el fichero de la fuente para
+   incrustarlo en base64 (la política de esta sesión prohíbe usar
+   `curl`/`requests` en la shell para saltarse las restricciones de las
+   herramientas de navegación web cuando el fetch normal no sirve para
+   binarios). Solución: `dashboard/assets/generate_wordmark.py` convierte
+   el texto "STOC" + "ER" a CONTORNOS vectoriales (paths SVG) con
+   `fonttools`, usando **Poppins Bold** como sustituta de Space Grotesk
+   (geométrica, proporciones parecidas, ya instalada localmente en el
+   entorno — no hubo que descargar nada). El resultado
+   (`stocker_wordmark.svg`) se ve exactamente igual en cualquier
+   navegador porque ya no depende de ninguna fuente instalada, ni de
+   conexión a internet — es el mismo criterio que usaría cualquier editor
+   de logos (los logotipos siempre se entregan como contornos, nunca como
+   texto editable, precisamente por esto). Verificado renderizando a PNG
+   con `cairosvg` antes de integrarlo (además de servir de verificación
+   visual, confirmó que SÍ hacía falta este paso: la primera versión con
+   `@font-face` embebido en base64 no se renderizó con la fuente correcta
+   ni siquiera en ese renderizador de prueba, la de contornos sí).
+3. **`ui.render_logo()`** ahora usa `st.logo(image=stocker_wordmark.svg,
+   icon_image=stocker_k_icon.svg)` — el wordmark completo cuando la barra
+   lateral está abierta, y el icono "K" suelto cuando está colapsada
+   (mismo patrón logo-completo/icono-compacto de cualquier app SaaS).
+4. **Favicon** (`Inicio.py`, `st.set_page_config(page_icon=...)`): antes
+   era el emoji 📈, ahora es `stocker_app_icon_dark.svg` (el cuadrado
+   navy — se eligió la variante `dark` porque la pestaña del navegador
+   casi siempre tiene fondo claro, y ahí es donde más contraste hace).
+5. **No se tocó nada más** — la petición decía "en toda la app", pero los
+   únicos sitios donde Streamlit permite un logo/icono de marca real son
+   estos dos (barra de navegación vía `st.logo()`, favicon vía
+   `page_icon`); el resto del contenido (KPIs, gráficos, tablas) no tiene
+   un "hueco de logo" propio. Los logos de EMPRESA por ticker (Logo.dev,
+   ver más arriba) son un concepto distinto — logo de la acción que se
+   está mirando, no de la app Stocker — y no se tocaron.

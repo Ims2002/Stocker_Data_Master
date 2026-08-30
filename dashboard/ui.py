@@ -7,12 +7,23 @@ CONTEXTO.md). Los colores base viven en .streamlit/config.toml — si cambian
 ahí, hay que revisar también el CSS de aquí (usa los mismos valores a mano
 porque Streamlit no expone las variables de tema dentro de CSS inyectado).
 
+Identidad de marca (2026-08-28, ver CONTEXTO.md "Identidad de marca: logos
+del artifact de claude.ai"): logotipo real a partir de los assets que trajo
+el usuario desde un artifact de claude.ai (icono "K" tipo gráfico de
+velas/tendencia + wordmark "STOCKER"), en vez del texto sencillo que había
+antes. Los ficheros viven en `dashboard/assets/` — ver ese directorio y
+`assets/generate_wordmark.py` para el porqué de regenerar el wordmark como
+contornos vectoriales en vez de reusar el HTML+Google-Fonts original.
+
 Uso en cada página/entrypoint:
     import ui
     ui.inject_css()
+    ui.render_logo()
 """
 
 from __future__ import annotations
+
+from pathlib import Path
 
 import streamlit as st
 
@@ -24,17 +35,20 @@ _GRIS_TEXTO = "#9CA3AF"
 _GRIS_LINEA = "#EEF0F2"
 _BORDE = "#E5E7EB"
 
-_LOGO_SVG = (
-    '<svg xmlns="http://www.w3.org/2000/svg" width="88" height="22">'
-    '<text x="0" y="16" font-family="sans-serif" font-size="15" '
-    f'font-weight="600" fill="{_NEGRO}">Stocker</text></svg>'
-)
+_ASSETS_DIR = Path(__file__).resolve().parent / "assets"
+WORDMARK_SVG_PATH = _ASSETS_DIR / "stocker_wordmark.svg"
+K_ICON_SVG_PATH = _ASSETS_DIR / "stocker_k_icon.svg"
+APP_ICON_DARK_SVG_PATH = _ASSETS_DIR / "stocker_app_icon_dark.svg"
+APP_ICON_LIGHT_SVG_PATH = _ASSETS_DIR / "stocker_app_icon_light.svg"
 
 
 def render_logo() -> None:
-    """Wordmark "Stocker" en la esquina superior izquierda de la barra de
-    navegación (mismo lugar donde iría el logo en la maqueta aprobada)."""
-    st.logo(_LOGO_SVG, size="medium")
+    """Logo real de Stocker en la esquina superior izquierda de la barra de
+    navegación: wordmark "STOCKER" (con el icono de tendencia sustituyendo
+    la "K") cuando la barra lateral está abierta, y solo el icono "K"
+    cuando está colapsada — mismo patrón que cualquier app SaaS con logo +
+    icono compacto (ver CONTEXTO.md)."""
+    st.logo(str(WORDMARK_SVG_PATH), icon_image=str(K_ICON_SVG_PATH), size="medium")
 
 
 def inject_css() -> None:

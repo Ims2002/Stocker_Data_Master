@@ -25,12 +25,21 @@ streamlit run ...` lo evita siempre.)
   (2026-08-27, ver CONTEXTO.md "Roadmap v1 (MVP para publicar)") registra
   solo 5 páginas de las 8 que llegó a haber — las 3 que se quitaron
   siguen existiendo como archivo, solo dejaron de registrarse aquí (se
-  recuperan añadiendo la línea de vuelta).
+  recuperan añadiendo la línea de vuelta). Desde el 2026-08-31 registra
+  una 6ª página nueva, "Contenido Premium" (`views/premium.py`, no es
+  parte del recorte de arriba — ver más abajo).
 - **`ui.py`** — CSS del tema minimalista blanco/azul/negro (aprobado por
   el usuario a partir de mockups, 2026-08-06) y el logo real de la
   cabecera (`render_logo()`, actualizado 2026-08-28 — ver `assets/` más
   abajo). Los colores base (`.streamlit/config.toml`) y este CSS deben
-  cambiarse juntos.
+  cambiarse juntos. **2026-08-31**: la línea inferior de la navbar usa un
+  degradado azul marino (`_AZUL_MARINO = "#1E3A8A"`) → blanco, desvanecido
+  en el último cuarto del ancho de pantalla. Se probó el mismo degradado
+  en los `st.divider()` del aside de filtros, pero el usuario lo quitó
+  ese mismo día — junto con los dos `st.divider()` de `views/dashboard.py`
+  que los sostenían, para no dejar hueco en blanco donde iba la línea. El
+  aside de filtros no tiene separadores por ahora. Ver CONTEXTO.md,
+  "Separadores en degradado azul marino: navbar + aside de filtros".
 - **`assets/`** (nuevo, 2026-08-28) — identidad de marca real, a partir de
   un artifact de claude.ai que trajo el usuario (icono "K" con forma de
   gráfico de velas alcista/bajista + wordmark "STOCKER"). Contiene los 4
@@ -71,7 +80,23 @@ streamlit run ...` lo evita siempre.)
   el wordmark "Stocker" que ya está en la barra de navegación superior).
   La cabecera es solo el subtítulo dinámico: logo del ticker + nombre de
   la empresa + `#TICKER`, en gris claro `#9CA3AF`, ver CONTEXTO.md
-  "Cabecera de marca en Dashboard".
+  "Cabecera de marca en Dashboard". **Rediseño 2026-08-30** (ver
+  CONTEXTO.md, "Medidor de sentimiento de mercado: reincorporado"): el
+  semicírculo de sentimiento de mercado vuelve (como 4ª tarjeta en la
+  fila de KPIs, no una sección propia), y el gráfico + noticias/lectura
+  rápida pasan a dos columnas lado a lado en vez de apiladas a todo lo
+  ancho. Ese mismo día se probó una segunda pasada (cajas de altura
+  igualada, líneas de degradado azul marino, menos padding) que el
+  usuario pidió revertir tras verla — se deshizo, quedando el layout tal
+  como se describe aquí. Lo que sí se mantuvo: el enlace "Profundizar en
+  Predicciones →" se quitó del todo (ya está en la navegación superior).
+  El semicírculo de sentimiento ahora se dibuja con `streamlit-echarts`
+  (Apache ECharts) en vez de `go.Indicator` de Plotly — misma paleta y
+  aguja azul que antes, pero con degradado y animación propios de
+  ECharts; elegida por el usuario frente a `streamviz` y frente a solo
+  pulir el Plotly existente. Ver CONTEXTO.md, "Segunda pasada revertida +
+  librería de gráficos para el semicírculo" y "Semicírculo de
+  sentimiento: librería nueva (`streamlit-echarts`, 2026-08-30)".
 - **`views/inicio.py`** (página "Resumen" — YA NO registrada en el v1,
   ver Inicio.py) — primera versión de un dashboard unificado
   (2026-08-13, ampliado 2026-08-18, ver CONTEXTO.md): KPIs generales +
@@ -108,6 +133,15 @@ streamlit run ...` lo evita siempre.)
   elegida, con aviso explícito de que las ~208 predicciones de un mismo
   día NO son observaciones independientes (ver CONTEXTO.md, "Seguimiento
   real de predicciones").
+- **`views/premium.py`** (nuevo, 2026-08-31; registrada en el v1 desde el
+  mismo día) — "Contenido Premium": vista previa del futuro apartado de
+  pago, con los 4 hyperscalers (AMZN, MSFT, GOOGL, META) en pestañas y
+  un apartado "Próximamente" para NVDA y SPX. Lee directamente los `.md`
+  de `docs/premium/` (fuera del pipeline, no toca la base de datos salvo
+  para nombre/logo de cada ticker) — si un archivo todavía no existe
+  para un ticker, muestra una tarjeta de "en preparación"/"Próximamente"
+  en su lugar. Sin login ni cobro todavía, a propósito — ver
+  CONTEXTO.md, "Contenido premium: página en el dashboard".
 - **`views/sentimiento_por_accion.py`** / **`views/sentimiento_del_mercado.py`**
   (nuevas, 2026-08-13; YA NO registradas en el v1, ver Inicio.py) —
   cuadros de mando de noticias/sentimiento, por ticker (con el mismo

@@ -952,3 +952,502 @@ imagen de marca en toda la app". Decisiones tomadas:
    un "hueco de logo" propio. Los logos de EMPRESA por ticker (Logo.dev,
    ver más arriba) son un concepto distinto — logo de la acción que se
    está mirando, no de la app Stocker — y no se tocaron.
+
+## Aviso de fecha de datos: quitado del Dashboard (2026-08-28)
+
+El usuario pidió eliminar el aviso "📅 Datos actualizados hasta el...".
+Se quitó de `views/dashboard.py` (la llamada y el `st.caption`), junto
+con el helper `_latest_data_date()` de esa página, que ya no se usaba.
+`data_access.get_latest_data_date()` se deja intacta (no molesta, y
+podría reutilizarse si se quiere volver a mostrar en el futuro).
+
+## Petición rechazada: forzar que la predicción no baje de 50% (2026-08-28)
+
+El usuario preguntó por qué la predicción diaria de NVDA había bajado de
+~52-54% a ~46% (respuesta: no cambió el modelo, cambiaron los datos de
+entrada del día — precio todavía por debajo de su media de 20 sesiones,
+volatilidad de 10 sesiones duplicada tras el +8.7% de NVDA el 27/08,
+MACD casi cruzando por debajo de su señal; probabilidades entre 0.42 y
+0.54 en las últimas semanas, banda estrecha consistente con una señal
+débil). A continuación preguntó si se podía "maquillar" el modelo para
+que nunca bajara de 50%.
+
+**Se rechazó explícitamente** — falsear la salida contradice
+"Honestidad de resultado" (ver arriba en este documento, principio fijado
+por el propio usuario desde el inicio del proyecto): un modelo que
+siempre dijera SUBE no aprendería nada, solo repetiría el sesgo alcista
+general del mercado, y sería una red flag evidente para cualquiera que
+revise el proyecto. Se ofrecieron alternativas honestas (banda neutral
+en vez de corte rígido en 50%, o mejorar el modelo de verdad) — el
+usuario eligió la segunda, lo que llevó al experimento de abajo.
+
+## Experimento: features ampliadas (momentum relativo + indicadores
+   técnicos) + ensemble (2026-08-29/30)
+
+Consecuencia directa de lo anterior: el usuario pidió explorar mejoras
+reales del modelo — features de mercado/sector, más indicadores
+técnicos, y un ensemble de los 3 modelos ya soportados — "al margen de
+la versión actual, para ver qué tal se comporta antes de incorporarlo a
+cualquier otra versión" (mismo criterio que `experiment_single_ticker.py`
+en su momento: experimento aislado, no toca `models/` ni `predictions`).
+
+Antes de escribir nada se revisó qué se había intentado YA sin éxito
+(ver "Plan B: Gradient Boosting + tuning" y "Preparación de noticias como
+feature" arriba): LightGBM con tuning de hiperparámetros no bate al
+baseline mayoritario (0.507 vs. 0.516), con los 20 resultados de
+validación apretados entre 0.504-0.508 — descarta que fuera un problema
+de hiperparámetros mal elegidos. Sentimiento de noticias tampoco aporta.
+
+**Nuevo script**: `src/experiment_extended_features.py` (permanece en el
+repo, a diferencia de `experiment_single_ticker.py` — este SÍ es
+reutilizable para probar otros horizontes/variantes, no una pregunta de
+una sola vez). Añade sobre las 16 features de producción:
+- Momentum relativo a mercado/sector (`rel_strength_mkt_1d/5d`,
+  `rel_strength_sector_1d/5d`): cuánto se mueve el ticker frente a la
+  media equiponderada de todo el universo / de su sector ESE MISMO día.
+  No requiere descargar nada nuevo (se calcula transversalmente sobre
+  `return_1d`/`return_5d`, ya existentes).
+- Estocástico %K/%D, ADX de Wilder, OBV relativo (z-score sobre su
+  propia media/desviación de 20 sesiones, no el OBV crudo, que es una
+  suma acumulada sin escala). Limitación documentada en el propio script:
+  usan `high`/`low` sin ajustar por splits (el esquema no guarda
+  versiones ajustadas de esas columnas), a diferencia del resto del
+  pipeline que usa `adj_close`.
+- Ensemble por voto blando (media de `predict_proba`) de
+  `random_forest` + `lightgbm` + `logistic`, cada uno con el feature set
+  ampliado (24 features en vez de 16).
+
+**Limitación de esta sesión (no del script)**: el sandbox donde se
+verificó tiene solo 2 CPUs y un límite duro de ~170s por comando —
+insuficiente para entrenar Random Forest con los `n_estimators=300` de
+producción sobre las ~487k filas de train (un solo entrenamiento tarda
+>170s). Se verificó con `n_estimators=100` para Random Forest únicamente
+(LightGBM y Logistic sí corrieron con los hiperparámetros reales — mucho
+más rápidos). El script en sí SIEMPRE usa los hiperparámetros de
+producción por defecto — el límite era del entorno de esta sesión, no
+del código. Para una cifra 100% fiel con Random Forest a 300 árboles,
+ejecutar en local: `python src/experiment_extended_features.py`.
+
+**Resultado real (208 tickers, horizonte día, split 2026-02-27 →
+2026-08-27, train=481.361 filas / test=26.189 filas)**:
+
+| Modelo | Features | Accuracy |
+|---|---|---|
+| Baseline mayoritario | — | **0.5065** |
+| Baseline persistencia | — | 0.4963 |
+| Random Forest (n=100*) | 16 (original) | 0.4981 |
+| Random Forest (n=100*) | 24 (ampliado) | 0.5007 |
+| LightGBM (producción) | 16 (original) | 0.4988 |
+| LightGBM (producción) | 24 (ampliado) | 0.4993 |
+| Logistic | 16 (original) | 0.5044 |
+| Logistic | 24 (ampliado) | 0.5034 |
+| Ensemble (RF+LGBM+Logistic) | 16 (original) | 0.5009 |
+| Ensemble (RF+LGBM+Logistic) | 24 (ampliado) | 0.5029 |
+
+*Random Forest con n_estimators=100 en vez de 300 solo por el límite de
+cómputo de esta sesión (ver arriba).
+
+**Ninguna combinación —ni las features nuevas ni el ensemble— supera al
+baseline mayoritario (0.5065).** La importancia de features del Random
+Forest ampliado sí reparte peso razonable a las nuevas variables
+(`rel_strength_mkt_1d`, `stoch_d`, `stoch_k` quedan a media tabla, no al
+fondo) — no es "ruido muerto" que el modelo ignore, simplemente no aporta
+la señal que faltaba. Mismo desenlace que ya documentaban los
+experimentos anteriores: el techo real de esta tarea con datos de
+mercado públicos (precio/volumen/técnicos/sentimiento/momentum relativo)
+parece estar en ~0.50-0.51, indistinguible del baseline ingenuo dentro
+del ruido — resultado honesto a reportar tal cual (ver "Honestidad de
+resultado"), no un fallo del experimento ni del pipeline.
+
+**Idea aparte, NO implementada — fundamentales por ticker**: en paralelo
+el usuario preguntó si añadir datos fundamentales (P/E, EBITDA, ROE,
+capitalización, ingresos, dividendo — pegó una ficha de MSFT de
+investing.com) ayudaría. Se le explicó por qué NO se implementó: (1) es
+el horizonte equivocado — los fundamentales mueven el precio en
+trimestres/años, no explican la dirección de un día concreto; (2) riesgo
+real de look-ahead bias — los valores que se ven HOY (p. ej. BPA=18.00)
+no son los que existían públicamente en cada fecha histórica del
+entrenamiento; usarlos tal cual filtraría información del futuro al
+pasado. Para hacerlo bien haría falta una fuente de datos fundamentales
+point-in-time (con fecha real de publicación), que no existe en el
+pipeline actual y normalmente es de pago — fuente de datos nueva, no un
+cálculo sobre datos ya descargados como sí lo eran el momentum
+relativo/indicadores técnicos de este experimento. Queda como idea de
+Fase 3 (backlog), no descartada de raíz, pero no abordada ahora.
+
+## Petición rechazada: maquillar el resultado del modelo (2026-08-30)
+
+El usuario, tras ver que ninguna mejora real subía el accuracy (ver
+experimento de arriba), pidió tres cosas: (1) quitar tickers "con poco
+tiempo de vida" para mejorar el número, (2) forzar un suelo de 48% en la
+probabilidad de salida del modelo, (3) subir "aunque sea mínimamente" el
+accuracy mostrado de los horizontes semana/mes. Argumentó que, si 50% es
+tirar una moneda, acercarse artificialmente a ese número no tiene
+importancia.
+
+**Rechazado, las tres partes.** Motivos concretos dados al usuario:
+- (1) es data dredging/cherry-picking — elegir qué datos cuentan
+  DESPUÉS de ver el resultado que se quiere conseguir, no limpieza de
+  datos real (la exclusión legítima por historial insuficiente ya existe,
+  `config.MIN_HISTORY_ROWS_FOR_GOLD`, por una razón técnica —
+  calentamiento de MACD — no por el accuracy resultante).
+- (2) un suelo de 48% NO es simétrico ni "acercarse al azar": solo
+  empuja hacia arriba cuando el modelo calcula menos, nunca hacia abajo
+  cuando calcula más — sesga la salida siempre hacia parecer alcista, no
+  la centra en 50%.
+- (3) no tiene ninguna base estadística — es escribir un número sin que
+  ningún cálculo lo respalde, ni siquiera se puede enmarcar como
+  "acercarse al azar" (es inflar accuracy, no suavizarla).
+
+Se le explicó que el tamaño del maquillaje no cambia lo que es, y que un
+resultado honesto de "no bate al azar" es un hallazgo válido y defendible
+para una tesis (coherente con la hipótesis de eficiencia de mercado), a
+diferencia de presentar cifras fabricadas, que es un problema de
+integridad académica serio si se detecta (y se detecta fácilmente:
+basta con reentrenar y comparar). Se ofreció como alternativa real
+calibración de probabilidades (Platt/isotonic, con base estadística),
+sin garantizar ningún suelo — el usuario no ha pedido esto todavía.
+
+## Medidor de sentimiento de mercado: reincorporado (2026-08-30)
+
+El usuario pidió recuperar el semicírculo de sentimiento de mercado que
+se había quitado el 2026-08-25 (ver "Dashboard unificado (mockup)",
+RECORTADO). La razón de quitarlo entonces seguía siendo válida (era la
+única pieza que no se recentraba en la acción elegida), así que en vez
+de devolverlo como sección propia a todo lo ancho, se colocó como una
+4ª tarjeta dentro de la fila de KPIs (`st.columns([1,1,1,1.3])`, junto a
+Predicción/Probabilidad/Último cierre) — se lee como "un dato de
+contexto de mercado más" en vez de un bloque desconectado del resto de
+la página centrada en el ticker. No hizo falta ninguna consulta nueva:
+`data_access.get_market_sentiment_gauge()` ya existía desde 2026-08-25,
+sin usar a propósito, con este mismo propósito documentado en su
+docstring. Se dibuja con `go.Indicator(mode="gauge+number")`, rango
+[-1, 1] (mismo rango que `sentiment_scalar_label`), franjas de color
+suaves por tramo (bearish/neutral/bullish) y una caption con la etiqueta
+en español y el nº de artículos.
+
+## Rediseño de layout: sin scroll en 1920x1080 (2026-08-30)
+
+Petición del usuario: comprimir la distribución de `views/dashboard.py`
+para que quepa en una pantalla de 1920x1080 sin scroll — "más esencia de
+dashboard" (menos lista de secciones apiladas, más panel de control
+denso). Cambios:
+- El gráfico de precio y el bloque "noticias + lectura rápida" pasan de
+  apilados a todo lo ancho a dos columnas lado a lado
+  (`st.columns([2, 1])`).
+- Altura del gráfico de precio: 420px → 300px.
+- `_recent_articles()` reduce su límite de 6 a 4 artículos (columna más
+  estrecha, menos espacio por fila) y su renderizado pasa de una tabla
+  HTML de 3 columnas (necesitaba más ancho) a tarjetas apiladas
+  compactas (título arriba, fuente/fecha/etiqueta de sentimiento abajo
+  en una línea más pequeña).
+- Noticias y "Lectura rápida" ahora van en contenedores de altura fija
+  (`st.container(border=True, height=200)`) en vez de altura libre — un
+  contenedor de altura fija con scroll INTERNO propio si el contenido no
+  cabe es preferible a que crezca sin límite y empuje el resto de la
+  página hacia abajo, rompiendo el objetivo de "sin scroll en la
+  página".
+- Se quitaron los `st.divider()` entre secciones y los `st.subheader()`
+  se cambiaron por `st.markdown("**texto**")` (más compactos) — cada
+  divisor y cada subheader de Streamlit añade margen vertical fijo, y con
+  4-5 secciones eso solo ya ocupaba una parte notable del alto disponible.
+- El enlace "Profundizar → Predicciones" se movió de una sección propia
+  al pie de la columna del gráfico (una sola línea, `st.page_link` sin
+  `st.subheader` encima).
+
+**Limitación honesta**: no hay forma de verificar en píxeles reales
+desde este entorno (no hay navegador con el Streamlit real corriendo) —
+la verificación fue con `AppTest` (confirma que todo renderiza sin
+excepción y con el contenido esperado, pero no mide alturas ni
+confirma ausencia de scroll). El resultado final depende también del
+zoom/DPI del navegador del usuario. Pendiente de confirmación visual
+por el usuario en su propia pantalla; si todavía scrollea, hay más
+margen para comprimir (reducir altura de contenedores, quitar la
+caption de noticias, etc.).
+
+## Segunda pasada de rediseño (2026-08-30, tras ver capturas reales)
+
+El usuario mandó una captura real del dashboard (1920x1080) y pidió 4
+cosas más, ya con el layout de dos columnas de la pasada anterior visto
+en pantalla:
+
+1. **Scroll vertical todavía presente** — Streamlit deja bastante
+   `padding-top`/`padding-bottom` por defecto en el contenedor principal
+   (aparte del que ya se había recortado en las cajas de contenido). Se
+   añadió en `ui.py`:
+   `[data-testid="stMainBlockContainer"], .block-container { padding-top:
+   1.3rem; padding-bottom: 1rem; }` — dos selectores a la vez porque el
+   nombre del contenedor principal ha cambiado entre versiones de
+   Streamlit, y usar los dos no rompe nada si alguno no existe.
+2. **Las cajas no cuadraban** — en la captura, la columna de
+   noticias+lectura rápida quedaba visiblemente más alta que la columna
+   del gráfico (que además tenía el enlace "Profundizar" suelto debajo,
+   asimétrico). Se fijó una constante compartida (`_BOX_H = 380`,
+   repartida en `_NEWS_H`/`_INSIGHT_H` para la columna derecha) y las
+   TRES cajas (gráfico, noticias, lectura rápida) ahora son
+   `st.container(border=True, height=...)` con esa altura ya repartida —
+   si el contenido de alguna se pasa, esa caja concreta scrollea
+   internamente (aceptable), pero ya no descuadra la fila. El aviso de
+   sesiones sin resolver y el enlace "Profundizar" se sacaron de dentro
+   de la caja del gráfico a un pie compartido, a todo lo ancho, debajo de
+   las tres cajas — así ninguna crece de forma asimétrica.
+3. **Líneas de degradado azul marino** — en la barra de navegación
+   (`[data-testid="stHeader"]`, `border-image: linear-gradient(90deg,
+   #0B0F19, #1D4ED8) 1` en vez de una línea gris plana) y en la barra
+   lateral de filtros (`[data-testid="stSidebar"] hr` con `background:
+   linear-gradient(...)` en vez de `border-color` — un degradado
+   horizontal necesita ser un fondo, no un borde). Se añadieron dos
+   `st.divider()` nuevos en la sidebar de `views/dashboard.py`: uno bajo
+   "Filtros" (separa el título de los controles) y otro entre "Acción" y
+   "Horizonte de predicción" (separa selección de acción de ventana
+   temporal) — antes no había ningún divisor ahí.
+4. **Semicírculo de sentimiento**, mejoras visuales: título integrado
+   dentro del propio gráfico (`title` de `go.Indicator`, antes iba solo
+   como caption externa), más alto (100px → 140px) y la columna que lo
+   contiene más ancha (ratio 1.3 → 1.6 en `st.columns`), aguja/línea de
+   umbral (`threshold`) marcando el valor exacto sobre el arco, ticks del
+   eje explícitos en -1/-0.5/0/0.5/1, número con signo (`+.2f`) y tamaño
+   de fuente mayor. La caption de debajo ahora también muestra los días
+   de cobertura (`n_dias`), no solo el nº de artículos.
+
+Misma limitación que la pasada anterior: verificado con `AppTest` (sin
+excepciones, dividers/captions presentes en día y semana), no con
+píxeles reales — pendiente de que el usuario confirme visualmente tras
+reiniciar el servidor local.
+
+## Segunda pasada revertida + librería de gráficos para el semicírculo (2026-08-30)
+
+El usuario vio la segunda pasada en su pantalla y pidió volver a la
+versión anterior (la del primer rediseño de ese mismo día — gauge en la
+fila de KPIs + dos columnas, sin cajas de altura igualada ni líneas de
+degradado) y, además, quitar del todo el enlace "Profundizar en
+Predicciones →" del pie de la columna del gráfico.
+
+**Revertido en `ui.py`**: el `padding-top`/`padding-bottom` recortado del
+contenedor principal, la línea de degradado de la cabecera
+(`border-image`), y la línea de degradado de los `hr` de la sidebar —
+los tres vueltos a como estaban antes de la segunda pasada.
+
+**Revertido en `views/dashboard.py`**: los dos `st.divider()` nuevos de
+la sidebar, las cajas de altura igualada (`_BOX_H`/`_NEWS_H`/
+`_INSIGHT_H`) vueltas a alturas fijas independientes (200/200, gráfico
+sin envolver en contenedor de altura fija), y el semicírculo vuelto a su
+versión anterior (sin título integrado, sin aguja de umbral, altura 100,
+columna con ratio 1.3 en vez de 1.6).
+
+**NO revertido, a propósito**: el enlace `st.page_link("views/predicciones.py", ...)` se eliminó
+por completo (no se movió, se quitó) — ya está accesible desde la
+navegación superior de la app, no hacía falta duplicarlo en el pie de
+esta página.
+
+**Pendiente, no implementado todavía**: el usuario pidió buscar una
+librería de gráficos que permita un semicírculo más atractivo que el
+`go.Indicator` de Plotly. Investigación de opciones documentada aparte
+más abajo — a la espera de que el usuario elija antes de tocar código
+(cambiar de librería significa una dependencia nueva en
+`requirements.txt`, así que se consulta antes de implementar, ver
+"Honestidad de resultado"/"SIEMPRE ante cualquier duda" en este mismo
+documento).
+
+## Semicírculo de sentimiento: librería nueva (`streamlit-echarts`, 2026-08-30)
+
+**Investigación** (dos candidatas comparadas, ambas vía PyPI):
+
+- `streamlit-echarts` — envoltorio de Apache ECharts. Versión 0.7.0
+  (junio 2026), licencia MIT, requiere Python ≥3.10 (el proyecto usa
+  3.10, compatible). Mantenedor único, en modo "best-effort" mantiene
+  publicando versiones recientes. El tipo de gráfico `gauge` de ECharts
+  admite degradados en el arco, aguja con estilo propio y animación del
+  valor — bastante más pulido que `go.Indicator` de Plotly. Coste:
+  ~700KB, motor de gráficos nuevo además del Plotly que ya usa el resto
+  del dashboard.
+- `streamviz` — envoltorio ligero, pero por debajo sigue siendo un
+  `go.Indicator` de Plotly con presets de color; sin publicar desde
+  noviembre 2023 (mantenedor único, ~3 años sin actividad) y con el
+  mismo techo visual que ya no convenció al usuario.
+
+**Decisión del usuario**: `streamlit-echarts` (elegida directamente
+frente a `streamviz` y frente a solo pulir el `go.Indicator` existente,
+tras presentar las tres opciones con sus contras).
+
+**Implementación**: `streamlit-echarts` añadido a `requirements.txt`.
+En `views/dashboard.py`, el bloque del semicírculo (dentro de la
+columna 4 de la fila de KPIs) pasa de `go.Figure(go.Indicator(...))` +
+`st.plotly_chart` a `st_echarts(options=gauge_option, height="110px")`.
+El `gauge_option` reproduce la misma paleta de antes (bandas rojo→verde
+según el signo/magnitud del sentimiento, aguja azul `#1D4ED8`), usando
+`startAngle=180`/`endAngle=0` para el semicírculo, `axisLine.color` con
+los mismos 5 tramos de color que tenía el Plotly (mapeados a fracciones
+0–1 del rango [-1,1]), aguja (`pointer`) y ancla (`anchor`) en azul
+corporativo, ticks/labels en gris (`#9CA3AF`), y el valor numérico
+centrado en negro (`#0B0F19`). El resto del bloque (import de
+`data_access.get_market_sentiment_gauge()`, el caption de debajo con la
+etiqueta y nº de artículos) no cambió.
+
+Verificado con `AppTest` contra la base de datos real de 208 tickers —
+sin excepciones al cargar "Dashboard" ni al cambiar de horizonte/ticker.
+No verificado con captura de pantalla real todavía (pendiente de que el
+usuario confirme visualmente tras reiniciar el servidor local, igual que
+en el resto de cambios de diseño de este mismo día).
+
+## Separadores en degradado azul marino: navbar + aside de filtros (2026-08-31)
+
+El usuario pidió recuperar, de forma aislada, la única pieza de la
+"segunda pasada" del 2026-08-30 que se había revertido por completo:
+líneas separadoras en degradado azul marino → blanco (desvanecidas en el
+último cuarto del ancho de pantalla), tanto en la línea inferior de la
+navbar como en los `st.divider()` del aside de filtros.
+
+**`ui.py`**: nueva constante `_AZUL_MARINO = "#1E3A8A"` (distinta de
+`_AZUL` `#1D4ED8`, el azul de acento ya usado en botones/aguja del
+semicírculo — este es un tono más oscuro, "marino", solo para estas
+líneas). La línea inferior de `[data-testid="stHeader"]` pasa de un
+`border-bottom` gris fino y plano a un `border-image` con
+`linear-gradient(to right, azul marino 0%, azul marino 75%, transparente
+100%)`. Los `hr` dentro de `[data-testid="stSidebar"]` (y solo ahí — el
+resto de separadores de la app se quedan con la línea gris de siempre)
+usan el mismo degradado como `background`, con `border: none` y `height:
+2px`.
+
+**`views/dashboard.py`**: se vuelven a añadir los dos `st.divider()` en
+el aside de filtros (después del subtítulo "Filtros"; entre el
+selectbox de "Acción" y el control de "Horizonte de predicción") para
+que el degradado tenga algo que pintar — sin estos, la única línea nueva
+visible habría sido la de la navbar.
+
+Verificado con `AppTest` contra la base real: "Dashboard" y el resto de
+páginas registradas (Predicciones, Importancia de features, Rendimiento
+del modelo, Seguimiento real) cargan sin excepciones — el CSS de `ui.py`
+es compartido por toda la app, así que se comprobó que el cambio no rompe
+ninguna otra página. No verificado con captura de pantalla real todavía.
+
+**Revertido el mismo aside, un día después (2026-08-31)**: el usuario
+quitó a mano la regla CSS del degradado en `ui.py`
+(`[data-testid="stSidebar"] hr {...}`), pero eso solo quita el estilo de
+la línea — los dos `st.divider()` de `views/dashboard.py` seguían ahí,
+así que quedaba espacio en blanco donde antes estaba la línea (el hueco
+lo genera el bloque del separador, no su estilo). Se quitaron también
+esas dos llamadas `st.divider()` (antes de "Sector", después de
+"Acción") y el comentario CSS que quedó huérfano en `ui.py`. La línea
+degradada de la navbar (`[data-testid="stHeader"]`) no se tocó, sigue en
+pie. Verificado de nuevo con `AppTest`, sin excepciones.
+
+## Apartado de pago: análisis en detalle de hyperscalers (2026-08-31)
+
+El usuario planteó un futuro apartado de pago en Stocker, empezando por
+análisis en detalle de acciones concretas. Antes de tocar código se
+acotó el alcance con el usuario (ver "SIEMPRE ante cualquier duda"):
+
+- **Contenido primero, infraestructura después.** Esta fase es solo
+  contenido — nada de sistema de usuarios, login ni cobro todavía. Eso
+  se diseña más adelante, una vez el contenido exista y se valide el
+  formato. Además, Stocker hoy no tiene ningún sistema de autenticación
+  (Streamlit no lo trae de fábrica), así que sería una pieza nueva de
+  arquitectura, no un ajuste — se avisó al usuario de esto antes de
+  aceptar el alcance.
+- **Universo de esta primera tanda**: AMZN, MSFT, GOOGL, META (los
+  "hyperscalers" — se incluye Meta pese a no vender cloud como negocio
+  principal, por su gasto en infraestructura/IA).
+- **Fuente de información**: el usuario pega transcripción o notas de un
+  vídeo de YouTube por acción (no el vídeo en sí ni su transcripción
+  íntegra reproducida tal cual — para no reproducir contenido con
+  derechos de autor, ver política de citas de este mismo asistente).
+- **Aviso legal**: este contenido es informativo/educativo, no
+  asesoramiento financiero personalizado — mismo principio que ya aplica
+  al resto de Stocker (ver "Honestidad de resultado" más abajo en este
+  documento). Si el apartado de pago llega a construirse de verdad, este
+  aviso tiene que estar en el producto final, no solo en el borrador.
+
+**Estructura creada** (`docs/premium/`, separado de `docs/entregas/`
+para no mezclarlo con las entregas del TFM): `README.md` con el porqué y
+las reglas de esta línea de contenido, y
+`hyperscalers/_plantilla.md` con las secciones fijas de cada análisis
+(resumen ejecutivo, negocio cloud/IA, catalizadores, riesgos, datos
+citados en el vídeo con nota de si están contrastados, notas
+adicionales). Los archivos de aquí no los lee ningún módulo de `src/` ni
+`dashboard/` — es contenido editorial, no parte del pipeline de datos.
+
+**Pendiente**: el usuario empieza a pasar transcripción/notas por
+acción; cada `hyperscalers/<TICKER>.md` se redacta a partir de eso
+siguiendo la plantilla. El diseño de la página del dashboard y de la
+infraestructura de pago (login, Stripe u otra pasarela) se queda fuera
+de alcance hasta que haya contenido real que mostrar.
+
+### Primer análisis entregado: MSFT (2026-08-31)
+
+El usuario pegó la transcripción de un vídeo de análisis de terceros
+sobre los resultados del cuarto trimestre del año fiscal 2026 de
+Microsoft, y adjuntó dos documentos oficiales de Microsoft: el
+comunicado de resultados (`PressReleaseFY26Q4.docx`) y la transcripción
+oficial de la llamada de resultados (`TranscriptFY26Q4.docx`).
+
+**Regla nueva, para este y todos los análisis futuros de esta serie**:
+eliminar del redactado final cualquier referencia al canal, presentador,
+patrocinadores o anécdotas personales del vídeo de origen — solo entra
+contenido relevante para la empresa analizada. El vídeo se trata como
+materia prima para reescribir con palabras propias, no para resumir
+ligeramente (esto además evita problemas de derechos de autor). Guardado
+como memoria persistente para no tener que repetir esta instrucción en
+cada ticker.
+
+**Metodología aplicada**: los dos documentos oficiales se leyeron con
+`pandoc` y se usaron para contrastar, dato por dato, lo que decía el
+vídeo. `docs/premium/hyperscalers/MSFT.md` distingue explícitamente qué
+cifras están confirmadas en el comunicado/transcripción oficial de este
+trimestre (ingresos, BPA GAAP/no-GAAP, RPO comercial y su desglose por
+plazos, Capex, flujo de caja, la ganancia de Anthropic, etc.) de cuáles
+proceden solo del vídeo y no se han podido verificar con las fuentes
+disponibles (el RPO *total* de 684.000M vs. el *comercial* de 678.000M,
+los ingresos de OpenAI de 24.100M$, los datos de la llamada de enero de
+2026, y las estimaciones de peso de OpenAI dentro del RPO). El
+documento explica en profundidad, con analogías para lectores sin
+conocimientos de inversión, qué es el RPO, por qué la reducción de Capex
+anunciada es un ajuste contable (cambio de vida útil de los centros de
+datos, no un recorte real) y por qué la concentración en OpenAI es el
+riesgo central a vigilar, aunque hoy represente menos del 10% de los
+ingresos ya facturados.
+
+Pendiente: AMZN, GOOGL y META, cuando el usuario pase el material de
+cada uno.
+
+### Contenido premium: página en el dashboard (2026-08-31)
+
+El usuario pidió llevar todo esto a una página real del dashboard: una
+página con los 4 hyperscalers más dos apartados de "Próximamente" para
+NVDA y SPX (el índice S&P 500), accesible mediante un botón/entrada de
+navegación llamado "Contenido Premium".
+
+**Sigue siendo solo contenido, sin cobro.** No se ha añadido login ni
+pasarela de pago — cualquiera que abra Stocker puede ver esta página tal
+cual. Eso era una decisión explícita de la fase anterior (ver "Apartado
+de pago: análisis en detalle de hyperscalers" más arriba) y sigue
+vigente: esto es una vista previa de lo que será el apartado de pago,
+no el apartado de pago en sí.
+
+**Implementación** (`dashboard/views/premium.py`, nuevo, registrado en
+`Inicio.py` como 6ª página con icono 🔒): lee directamente los `.md` de
+`docs/premium/` con `pathlib` — no toca la base de datos salvo para
+nombre/logo de cada ticker (reutiliza `data_access.get_ticker_metadata`
+y `ticker_logo_url`, igual que el resto del dashboard). Estructura de la
+página:
+- Cabecera + aviso de que es contenido informativo/educativo, sin cobro
+  todavía.
+- Un `st.tabs()` por cada hyperscaler (AMZN, MSFT, GOOGL, META): si
+  existe `docs/premium/hyperscalers/<TICKER>.md`, se renderiza tal cual
+  con `st.markdown()`; si no existe todavía (AMZN, GOOGL, META, a fecha
+  de hoy), se muestra una tarjeta con logo + nombre + "Análisis en
+  preparación" en su lugar, en vez de un hueco vacío o un error.
+- Una sección "Próximamente" aparte, con una tarjeta para NVDA y otra
+  para SPX (`docs/premium/otros/<TICKER>.md`, carpeta nueva, todavía sin
+  ningún archivo) — SPX no está en `stocks` (no es una acción
+  individual, es un índice), así que su nombre va a mano en el código en
+  vez de salir de `get_ticker_metadata`.
+
+Diseñada para no requerir tocar código cada vez que se añade un análisis
+nuevo: en cuanto exista `docs/premium/hyperscalers/AMZN.md` (o el que
+toque), la página lo recoge solo, sin cambios en `premium.py`.
+
+Verificado con `AppTest` contra la base real — las 6 páginas registradas
+cargan sin excepciones, y se comprobó explícitamente que la pestaña de
+MSFT renderiza el análisis completo mientras AMZN/GOOGL/META muestran la
+tarjeta de "en preparación" y NVDA/SPX la de "Próximamente".

@@ -27,6 +27,12 @@ registrarse aquí — se pueden recuperar cambiando esta lista):
   backfill de Alpha Vantage (~9 días desde cero) y CONTEXTO.md ya
   documenta que esa señal no ayuda a predecir el precio; no bloquean el
   valor central del v1 (predicción + honestidad de resultado).
+
+AÑADIDA UNA 6ª PÁGINA 2026-08-31 (ver CONTEXTO.md, "Contenido premium:
+página en el dashboard"): "Contenido Premium" (views/premium.py), fuera
+del recorte de arriba porque no es una página que se quitara y se
+recupere, es nueva — vista previa del futuro apartado de pago, todavía
+sin login ni cobro real detrás.
 """
 
 from __future__ import annotations
@@ -50,6 +56,7 @@ pages = [
     st.Page("views/importancia_de_features.py", title="En qué se fija"),
     st.Page("views/rendimiento_del_modelo.py", title="¿Funciona de verdad?"),
     st.Page("views/seguimiento_real.py", title="Día a día"),
+    st.Page("views/premium.py", title="Contenido Premium", icon="🔒"),
 ]
 pg = st.navigation(pages, position="top")
 pg.run()

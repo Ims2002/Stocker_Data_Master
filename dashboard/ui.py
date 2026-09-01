@@ -30,6 +30,7 @@ import streamlit as st
 # Mismos valores que .streamlit/config.toml — repetidos aquí porque el CSS
 # inyectado no puede leer el theme.toml directamente.
 _AZUL = "#1D4ED8"
+_AZUL_MARINO = "#1E3A8A"
 _NEGRO = "#0B0F19"
 _GRIS_TEXTO = "#9CA3AF"
 _GRIS_LINEA = "#EEF0F2"
@@ -55,10 +56,15 @@ def inject_css() -> None:
     st.markdown(
         f"""
         <style>
-        /* Cabecera: fondo blanco, línea muy fina abajo en vez de sombra */
+        /* Cabecera: fondo blanco, línea inferior en degradado azul marino
+           que se desvanece a blanco en el último cuarto del ancho de
+           pantalla (en vez de la línea gris fina plana de antes). */
         [data-testid="stHeader"] {{
             background: #FFFFFF;
-            border-bottom: 0.5px solid {_BORDE};
+            border-bottom: 3px solid transparent;
+            border-image: linear-gradient(
+                to right, {_AZUL_MARINO} 0%, {_AZUL_MARINO} 75%, rgba(255,255,255,0) 100%
+            ) 1;
         }}
 
         /* Oculta lo que sobra de la barra por defecto de Streamlit (menú

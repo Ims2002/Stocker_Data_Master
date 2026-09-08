@@ -13,6 +13,7 @@ python-dotenv
 streamlit
 plotly
 streamlit-echarts
+anthropic
 
 # Opcional — solo si se usa `python model.py --model lightgbm` (con o sin
 # --tune). El resto del pipeline (random_forest, logistic) no depende de

@@ -33,6 +33,12 @@ página en el dashboard"): "Contenido Premium" (views/premium.py), fuera
 del recorte de arriba porque no es una página que se quitara y se
 recupere, es nueva — vista previa del futuro apartado de pago, todavía
 sin login ni cobro real detrás.
+
+AÑADIDA UNA 7ª PÁGINA 2026-09-05 (ver CONTEXTO.md, "Comparador de
+gráficos: dos acciones en un mismo gráfico"): "Comparador"
+(views/comparador.py) — parte del apartado free, independiente de
+predicción/backtest, deja elegir dos tickers y ver su precio normalizado
+en un mismo gráfico.
 """
 
 from __future__ import annotations
@@ -53,6 +59,7 @@ ui.render_logo()
 pages = [
     st.Page("views/dashboard.py", title="Dashboard", default=True),
     st.Page("views/predicciones.py", title="Predicciones"),
+    st.Page("views/comparador.py", title="Comparador"),
     st.Page("views/importancia_de_features.py", title="En qué se fija"),
     st.Page("views/rendimiento_del_modelo.py", title="¿Funciona de verdad?"),
     st.Page("views/seguimiento_real.py", title="Día a día"),

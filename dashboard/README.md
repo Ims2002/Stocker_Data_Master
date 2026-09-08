@@ -5,7 +5,9 @@ en `models/`. Nunca escribe nada — todas las escrituras las hacen los
 módulos de `src/` (ver [`../src/README.md`](../src/README.md)). Si algo
 sale desactualizado aquí, el problema está en si corriste el pipeline
 (`download.py` → `load.py` → `gold.py` → `model.py` → `predict.py`), no en
-el dashboard.
+el dashboard. **Única excepción** (2026-08-31, ver `premium_chat.py` más
+abajo): el chat de "Contenido Premium" escribe un contador de uso local
+para controlar coste — nunca toca `stocker.db` ni `models/`.
 
 ## Lanzar
 
@@ -27,7 +29,9 @@ streamlit run ...` lo evita siempre.)
   siguen existiendo como archivo, solo dejaron de registrarse aquí (se
   recuperan añadiendo la línea de vuelta). Desde el 2026-08-31 registra
   una 6ª página nueva, "Contenido Premium" (`views/premium.py`, no es
-  parte del recorte de arriba — ver más abajo).
+  parte del recorte de arriba — ver más abajo). Desde el 2026-09-05
+  registra una 7ª, "Comparador" (`views/comparador.py`, tampoco parte
+  del recorte — ver más abajo).
 - **`ui.py`** — CSS del tema minimalista blanco/azul/negro (aprobado por
   el usuario a partir de mockups, 2026-08-06) y el logo real de la
   cabecera (`render_logo()`, actualizado 2026-08-28 — ver `assets/` más
@@ -141,7 +145,49 @@ streamlit run ...` lo evita siempre.)
   para nombre/logo de cada ticker) — si un archivo todavía no existe
   para un ticker, muestra una tarjeta de "en preparación"/"Próximamente"
   en su lugar. Sin login ni cobro todavía, a propósito — ver
-  CONTEXTO.md, "Contenido premium: página en el dashboard".
+  CONTEXTO.md, "Contenido premium: página en el dashboard". Cada
+  análisis lleva el logo de la empresa en una cabecera justo antes del
+  contenido (mismo bucle sobre `HYPERSCALERS`, se aplica solo con
+  añadir el `.md` — ver CONTEXTO.md, "Logo al inicio de cada análisis").
+  Debajo del análisis de cada ticker con contenido, un chat experto
+  (`premium_chat.py`) responde preguntas ancladas a esos documentos —
+  ver CONTEXTO.md, "Chat experto sobre earnings: viabilidad y diseño".
+- **`premium_chat.py`** (nuevo, 2026-08-31) — corpus + llamada a la API
+  de Anthropic + límites de uso del chat de "Contenido Premium".
+  Context-stuffing, no RAG vectorial (el corpus por ticker cabe entero
+  en el contexto del modelo). El corpus es SOLO el análisis redactado +
+  los documentos oficiales de `docs/premium/hyperscalers/<TICKER>_fuentes/`
+  — nunca la transcripción del vídeo de terceros. **Única excepción
+  documentada a la regla de "el dashboard nunca escribe nada"** (ver
+  cabecera de este README): escribe un contador de uso diario en
+  `dashboard/.premium_chat_usage.json` (fuera de git) para limitar el
+  gasto de una función que, a diferencia del resto del dashboard, sí
+  cuesta dinero por petición y todavía es pública sin login. Sin
+  `ANTHROPIC_API_KEY` configurada, el chat se deshabilita solo con un
+  aviso — el resto del dashboard sigue funcionando igual. Si tu clave de
+  Anthropic es "identity-linked" (personal/de service account sin
+  workspace fijado al crearla), necesitarás además `ANTHROPIC_WORKSPACE_ID`
+  en `.env` — ver la nota en `src/config.py` y CONTEXTO.md, "Error del
+  chat: `anthropic-workspace-id` requerido". La conversación va dentro
+  de un `st.container(height=420, autoscroll=True)` (mensaje más
+  reciente siempre visible, historial hacia arriba con scroll) con un
+  estado vacío con preguntas sugeridas antes de escribir nada — ver
+  CONTEXTO.md, "Estética del chat: caja acotada + estado vacío".
+- **`views/comparador.py`** (nuevo, 2026-09-05) — "Comparador": parte del
+  apartado free, no de "Contenido Premium" — deja elegir dos tickers
+  cualquiera del universo (mismo selector sector→ticker que
+  "Predicciones", factorizado para no duplicarlo al usarse dos veces en
+  la misma página) y ver su precio en el mismo gráfico,
+  **independientemente de cualquier predicción o backtest**. El precio se
+  normaliza a base 100 en el inicio de la ventana elegida (no el precio
+  bruto) porque comparar acciones con escalas muy distintas en el mismo
+  eje Y no es legible — ver CONTEXTO.md, "Comparador de gráficos: dos
+  acciones en un mismo gráfico". v1 a propósito: solo el gráfico de
+  precio normalizado; el archivo deja dos puntos de extensión sin
+  implementar (`_render_technical_panel()`, `_render_correlation_kpi()`)
+  para añadir más adelante un panel de indicadores técnicos comparados y
+  un KPI de correlación entre las dos series, sin tener que rehacer la
+  página.
 - **`views/sentimiento_por_accion.py`** / **`views/sentimiento_del_mercado.py`**
   (nuevas, 2026-08-13; YA NO registradas en el v1, ver Inicio.py) —
   cuadros de mando de noticias/sentimiento, por ticker (con el mismo

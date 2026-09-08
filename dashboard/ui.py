@@ -99,6 +99,23 @@ def inject_css() -> None:
             border-radius: 10px !important;
         }}
 
+        /* Caja del chat experto de "Contenido Premium" (2026-09-01):
+           borde azul marino por defecto (en vez del gris genérico de
+           arriba) y un hover más suave que el que trae Streamlit por
+           defecto para contenedores con scroll — la clave del
+           contenedor (`key=f"premium_chat_box_{{ticker}}"`) genera una
+           clase `st-key-premium_chat_box_<TICKER>` distinta por cada
+           ticker, de ahí el selector por subcadena en vez de una clase
+           exacta. */
+        [data-testid="stVerticalBlockBorderWrapper"][class*="st-key-premium_chat_box"] {{
+            border-color: {_AZUL_MARINO} !important;
+            transition: border-color 0.15s ease;
+        }}
+        [data-testid="stVerticalBlockBorderWrapper"][class*="st-key-premium_chat_box"]:hover {{
+            border-color: rgba(30, 58, 138, 0.45) !important;
+            box-shadow: none !important;
+        }}
+
         /* Separadores (st.divider): línea de 0.5px en vez de 1px, mismo
            gris muy claro que en la maqueta. */
         hr {{

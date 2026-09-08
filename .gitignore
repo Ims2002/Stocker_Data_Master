@@ -69,6 +69,11 @@ ENV/
 # --- Logs de ejecución (p. ej. run_news_daily.bat -> data/news_cron.log) ---
 *.log
 
+# --- Contador de uso del chat de "Contenido Premium" (ver CONTEXTO.md,
+# "Chat experto sobre earnings: viabilidad y diseño") — estado local de
+# control de coste, no un dato del proyecto, no se versiona.
+dashboard/.premium_chat_usage.json
+
 # --- Editor / SO ---
 .vscode/
 .idea/

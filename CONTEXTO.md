@@ -1451,3 +1451,542 @@ Verificado con `AppTest` contra la base real — las 6 páginas registradas
 cargan sin excepciones, y se comprobó explícitamente que la pestaña de
 MSFT renderiza el análisis completo mientras AMZN/GOOGL/META muestran la
 tarjeta de "en preparación" y NVDA/SPX la de "Próximamente".
+
+### Chat experto sobre earnings: viabilidad y diseño (2026-08-31)
+
+El usuario propuso un RAG por cada análisis (transcripción limpia +
+datos del análisis) para que los usuarios pudieran preguntar dudas sobre
+los earnings de cada hyperscaler, y pidió analizar viabilidad antes de
+construir nada. Antes de tocar código se le planteraron tres cosas:
+
+1. **El tamaño del corpus no pide RAG vectorial de verdad.** Por ticker,
+   el comunicado de resultados + la transcripción de la earnings call +
+   el análisis ya redactado caben enteros en el contexto de Claude sin
+   necesitar recuperación selectiva (embeddings + base de datos
+   vectorial) — trocear documentos tan cortos suele empeorar la calidad
+   de las respuestas, no mejorarla. Se decidió context-stuffing (meter
+   todo el corpus del ticker en el system prompt) en vez de RAG
+   vectorial; si en el futuro el corpus crece mucho (muchos trimestres ×
+   muchos tickers), ahí sí compensaría montar recuperación de verdad.
+2. **Qué entra en el corpus y qué no.** Los documentos oficiales de la
+   compañía (comunicado + transcripción de la earnings call — dominio
+   público, publicados por la propia empresa para este uso) y el
+   análisis ya redactado, SÍ. La transcripción del vídeo de terceros que
+   sirvió de guía para escribir el análisis, NO — guardarla y servirla
+   dentro de un producto de pago sería reproducir contenido con derechos
+   de autor de otra persona, no transformarlo (mismo motivo que ya
+   aplicaba a `<TICKER>.md`, ver "Primer análisis entregado: MSFT" más
+   arriba y `feedback_strip_creator_refs_premium_content` en memoria).
+3. **Coste y control de acceso.** A diferencia del resto del dashboard
+   (gratis de servir), cada pregunta al chat cuesta dinero real (API de
+   pago), y la página de Contenido Premium es pública sin login todavía
+   — exponer un chat con coste sin ningún límite sería un riesgo de
+   gasto descontrolado.
+
+**Decisiones del usuario**: API de Anthropic (Claude) como proveedor, y
+límite simple sin login (no esperar al sistema de pago completo).
+
+**Implementación**:
+- `src/config.py`: `ANTHROPIC_API_KEY` (secreta, con coste — a
+  diferencia de `LOGO_DEV_TOKEN`, nunca debe ir a una URL de `<img>` ni
+  exponerse al cliente), `PREMIUM_CHAT_MODEL` (`claude-haiku-4-5`,
+  elegido a propósito por ser barato y suficiente para preguntas y
+  respuestas anclado a documentos concretos), `PREMIUM_CHAT_MAX_PER_SESSION`
+  (10) y `PREMIUM_CHAT_MAX_PER_DAY_GLOBAL` (150). Entrada añadida a
+  `.env.example`.
+- `docs/premium/hyperscalers/MSFT_fuentes/`: comunicado de resultados y
+  transcripción de la earnings call oficiales de MSFT (los mismos dos
+  documentos que el usuario adjuntó para redactar `MSFT.md`),
+  convertidos a Markdown con `pandoc` y guardados tal cual — son fuente
+  de contexto para el chat, no se muestran en la página.
+- `dashboard/premium_chat.py` (nuevo): `build_corpus(ticker)` concatena
+  el análisis + los documentos de `<TICKER>_fuentes/` (None si ni
+  siquiera hay análisis); `SYSTEM_PROMPT_TEMPLATE` obliga al modelo a
+  responder solo con esos documentos, a no dar recomendaciones de
+  inversión personalizadas, y a explicar conceptos financieros en
+  lenguaje sencillo; `ask()` llama a la API de Anthropic
+  (`client.messages.create`) y solo registra uso si la llamada tuvo
+  éxito. Límites: contador de sesión en `st.session_state` (se reinicia
+  al recargar) + contador global diario en un fichero JSON local
+  (`dashboard/.premium_chat_usage.json`, en `.gitignore`) — **única
+  excepción documentada a la regla de "el dashboard nunca escribe
+  nada"** (ver `dashboard/README.md`), y solo para ese fichero de
+  conteo, nunca para `stocker.db` ni `models/`.
+- `dashboard/views/premium.py`: `_render_chat(ticker, nombre)` debajo
+  del análisis de cada hyperscaler CON contenido disponible (no se
+  ofrece chat para tickers todavía en "preparación" o "Próximamente",
+  porque `build_corpus` devuelve `None` sin análisis). Historial de
+  conversación en `st.session_state` por ticker, con `st.chat_message`/
+  `st.chat_input` nativos de Streamlit. Si no hay `ANTHROPIC_API_KEY`
+  configurada, se muestra un aviso y el resto de la página sigue
+  funcionando igual — mismo patrón de "degradación sin romper nada" que
+  `LOGO_DEV_TOKEN`.
+- `requirements.txt` += `anthropic`.
+
+Verificado con `AppTest` (sin `ANTHROPIC_API_KEY`: las 6 páginas cargan
+sin excepciones, el chat se deshabilita solo con aviso; con una clave
+falsa configurada: el `st.chat_input` de MSFT aparece habilitado, sin
+excepciones) y con una prueba directa de `premium_chat.py` fuera de
+Streamlit (contador de uso persiste correctamente en el JSON,
+`build_corpus("MSFT")` arma ~215.000 caracteres de contexto,
+`build_corpus("AMZN")` devuelve `None` como se espera al no existir
+`AMZN.md` todavía). No se ha hecho ninguna llamada real a la API de
+Anthropic en ningún momento de esta verificación — no hay clave
+disponible en este entorno y no correspondía generar gasto sin que el
+usuario lo haya configurado él mismo.
+
+### Logo al inicio de cada análisis (2026-08-31)
+
+Petición del usuario: mostrar el logo de la empresa antes del análisis
+en "Contenido Premium", igual que ya se hace en la tarjeta de "en
+preparación" — y que se aplique a todos los análisis futuros, no solo a
+MSFT. Implementado en el propio bucle de `views/premium.py` que recorre
+`HYPERSCALERS` (no en un caso especial para MSFT): el logo/nombre se
+calculan una vez por ticker y, si hay `contenido` disponible, se pintan
+en una cabecera (mismo estilo que la tarjeta "en preparación": logo de
+32px + nombre + `#TICKER`) justo antes de `st.markdown(contenido)`. Así,
+en cuanto exista `docs/premium/hyperscalers/AMZN.md` (o el que toque),
+la cabecera con logo aparece sola, sin tocar código de nuevo. Verificado
+con `AppTest`: la cabecera de MSFT aparece antes del `# MSFT —
+Microsoft Corporation` del análisis, sin excepciones.
+
+### Error del chat: `anthropic-workspace-id` requerido (2026-08-31)
+
+Al probar el chat con su propia clave, el usuario recibió: `Error code:
+400 ... "anthropic-workspace-id is required when authenticating with an
+identity-linked API key; send the id of the workspace this request acts
+in."`. Investigado en la documentación oficial de Anthropic
+(platform.claude.com/docs/en/manage-claude/authentication): las claves
+"personal" o "de service account" creadas en Claude Console SIN fijar un
+workspace concreto ("Linked account: tú", sin marcar workspace) son
+"identity-linked" y trabajan en varios workspaces — por eso la API exige
+indicar en cuál actúa cada petición vía la cabecera
+`anthropic-workspace-id`. Las claves clásicas de workspace, o las
+personales/de service account creadas SÍ fijando un workspace concreto,
+no necesitan esta cabecera.
+
+**Arreglo**: nueva config opcional `ANTHROPIC_WORKSPACE_ID` en
+`src/config.py` (vacía por defecto) + entrada en `.env.example`. Si está
+rellena, `premium_chat.ask()` la manda como `default_headers` del
+cliente de Anthropic (`{"anthropic-workspace-id": ...}`); si no, no manda
+ninguna cabecera de más (mandarla solo cuando hace falta evita romper
+las claves que SÍ están ligadas a un workspace, que no la necesitan). El
+ID del workspace se saca de Claude Console > Settings > Workspaces >
+columna "ID" (`wrkspc_...`).
+
+**Nota aparte**: durante esta misma sesión se detectó que `.env.example`
+había desaparecido de la carpeta del proyecto (el usuario debió
+renombrarlo a `.env` en algún punto en vez de copiarlo) — se reconstruyó
+con el mismo contenido que tenía más la entrada nueva de
+`ANTHROPIC_WORKSPACE_ID`, sin tocar el `.env` real del usuario (con sus
+claves reales) para no leer ni exponer secretos innecesariamente.
+
+Verificado con `AppTest` (con `ANTHROPIC_API_KEY`/`ANTHROPIC_WORKSPACE_ID`
+de prueba configuradas, sin llamar a la API real): la página carga sin
+excepciones y el `st.chat_input` de MSFT aparece. Verificado también que
+`anthropic.Anthropic(..., default_headers=None)` (el caso sin
+`ANTHROPIC_WORKSPACE_ID`) sigue funcionando igual que antes de este
+cambio.
+
+### Estética del chat: caja acotada + estado vacío (2026-09-01)
+
+Con el chat ya funcionando, el usuario pidió dos ajustes visuales: más
+presencia/atractivo en el momento antes de escribir nada, y que el flujo
+fuera "de abajo hacia arriba" en vez de "de arriba hacia abajo" — la
+conversación empujaba el `st.chat_input` cada vez más abajo de una
+página ya muy larga (todo el análisis va justo encima), en vez de
+comportarse como una caja de chat normal con el mensaje más reciente
+siempre visible junto al input.
+
+**Arreglo**: la conversación de `_render_chat()`
+(`dashboard/views/premium.py`) ahora vive dentro de
+`st.container(height=420, border=True, autoscroll=True)` — un contenedor
+de Streamlit con scroll propio y parámetro `autoscroll` nativo (no hace
+falta CSS ni truco a mano) que mantiene visible el mensaje más reciente
+mientras el historial se desplaza hacia arriba con el scroll,
+exactamente el patrón "inline chat" documentado en la API de Streamlit
+(`st.chat_input` dentro de un contenedor con altura fija, en vez de
+pinneado al fondo de toda la página). Los mensajes nuevos se escriben en
+la MISMA referencia de contenedor (`chat_box.chat_message(...)`, no una
+nueva) para que aparezcan dentro de la caja, no fuera. Tras responder,
+se llama a `st.rerun()` para refrescar la caja de golpe (y ocultar las
+preguntas sugeridas, ver más abajo).
+
+**Estado vacío**: antes de que exista ningún mensaje, la caja ya no se
+queda en blanco — muestra un icono, un texto de invitación
+("Pregúntame lo que quieras sobre los resultados de {TICKER}") y, debajo
+de la caja, tres botones de preguntas sugeridas y genéricas (aplican a
+cualquier hyperscaler, no solo a MSFT: resumen en 3 frases, riesgos
+principales, qué es el RPO/backlog) que envían la pregunta igual que si
+se escribiera a mano. Los botones desaparecen en cuanto hay al menos un
+mensaje (mismo `if not history` que controla el estado vacío).
+
+Verificado con `AppTest`: la caja y los 3 botones aparecen sin mensajes;
+al simular el clic de un botón, la pregunta se envía, el intercambio
+aparece dentro de la caja (`at.chat_message`, roles `user`/`assistant`)
+y los botones desaparecen tras el `st.rerun()` — probado con una clave
+de Anthropic falsa (la llamada real falla con 401, capturada por el
+`try/except` ya existente, sin romper la página) y confirmando además
+que el contador de uso por sesión NO sube cuando la llamada falla (solo
+se registra uso si `premium_chat.ask()` tiene éxito, como ya estaba
+documentado).
+
+### Sin emoticonos + borde azul marino en el chat (2026-09-01)
+
+Dos ajustes más de estética, mismo día: quitar los emoticonos de la
+interfaz del chat, y que la caja tenga borde azul marino por defecto (no
+el gris genérico del resto de tarjetas) con un hover más suave que el
+que trae Streamlit de serie para contenedores con scroll.
+
+**Emoticonos quitados**: el 💬 del estado vacío (se quitó el círculo-icono
+entero, se quedan solo las dos líneas de texto) y el `icon="🔒"` del
+`st.info()` que avisa cuando falta `ANTHROPIC_API_KEY`. No se ha tocado
+el icono 🔒 de la entrada de navegación "Contenido Premium" en
+`Inicio.py` — eso es la navbar, no "la interfaz del chat", que es lo que
+pidió el usuario.
+
+**Borde azul marino**: la regla general de `ui.py` para tarjetas
+(`[data-testid="stVerticalBlockBorderWrapper"] { border-color:
+{_GRIS_LINEA} }`) sigue igual para el resto de la app — para no
+afectarla, el `st.container()` del chat ahora lleva
+`key=f"premium_chat_box_{{ticker}}"` (una clave distinta por ticker), que
+Streamlit traduce en una clase CSS `st-key-premium_chat_box_<TICKER>` en
+el propio wrapper. Nueva regla en `ui.py`, con selector por subcadena
+(`[class*="st-key-premium_chat_box"]`) para que aplique a los 4
+hyperscalers sin repetir la regla cuatro veces: borde `_AZUL_MARINO`
+(`#1E3A8A`) por defecto, y en `:hover` el mismo azul marino pero con
+opacidad reducida (`rgba(30, 58, 138, 0.45)`) — más suave que el
+comportamiento de hover que traía el contenedor sin esta regla.
+
+Verificado con `AppTest`: la página sigue sin excepciones con la clave
+por ticker en el contenedor (no hay colisión de `key` porque cada
+ticker es distinto dentro de la misma ejecución).
+
+### Segundo análisis entregado: AMZN, con un mix-up detectado antes de escribir nada (2026-09-02)
+
+El usuario pidió proceder con el análisis de Amazon adjuntando tres PDF
+(comunicado de resultados oficial `AMZN-Q2-2026-Earnings-Release.pdf`,
+el Form 10-Q y las slides de la conference call) y pegando una
+transcripción de vídeo. **Antes de escribir nada** se detectó una
+discrepancia real: la transcripción pegada era íntegramente sobre los
+resultados de Google/Alphabet (Google Cloud, YouTube, el EPS de $9,11 a
+$2,85, la adquisición de Wiz), no sobre Amazon, mientras que los tres
+PDF sí eran genuinamente de Amazon (confirmado con `pdftotext` sobre
+cada uno, incluyendo el nombre de la compañía en la portada del 10-Q).
+Se surgió la discrepancia al usuario con evidencia concreta en vez de
+asumir cuál de las dos fuentes tenía prioridad — aplicando la misma
+regla de "preguntar ante cualquier duda" que ya rige el resto del
+proyecto. El usuario confirmó el error y pegó la transcripción correcta
+(íntegramente sobre Amazon: los 62.647M$ de beneficio, AWS, la
+inversión en Anthropic) en su siguiente mensaje, pidiendo explícitamente
+borrar de la memoria cualquier resto de la transcripción de Google.
+
+**Metodología aplicada, con una fuente extra respecto a MSFT**: a
+diferencia de MSFT (comunicado + transcripción de la earnings call), en
+este caso el usuario no adjuntó la transcripción de la llamada de
+resultados con analistas — en su lugar se dispuso del comunicado
+oficial, el Form 10-Q completo (informe trimestral ante la SEC) y las
+slides de la conference call. El 10-Q resultó especialmente rico para
+contrastar el vídeo: confirma con precisión el desglose de la inversión
+de Amazon en Anthropic entre bonos convertibles (97.900M$, con una
+ganancia no realizada de 92.000M$ que va al balance vía "otro resultado
+integral", no a la cuenta de resultados) y acciones preferentes sin voto
+(92.500M$, cuya revalorización de 50.500M$ SÍ pasa por la cuenta de
+resultados y explica el grueso de los 53.400M$ de "otros ingresos" del
+trimestre) — así como la inversión en OpenAI (28.700M$), el backlog de
+AWS ("performance obligations", 496.000M$ con vida media de 6,4 años,
+confirmando la cifra exacta que daba el vídeo) y el desglose entre
+impuestos provisionados (27.759M$ en 6 meses) y pagados en caja
+(3.978M$), con 15.900M$ de ese desfase atribuido explícitamente por el
+propio 10-Q a la revalorización de Anthropic.
+
+**Recorte del 10-Q para el corpus del chat**: el Form 10-Q completo
+(pdftotext) pesaba ~988KB, la mayor parte certificaciones legales,
+listado de exhibits y firmas sin contenido financiero (Item 6 en
+adelante). Se recortó a los primeros ~2.410 líneas (Item 1 Estados
+Financieros, Item 2 MD&A, Item 3 Riesgo de mercado, Item 4 Controles,
+Parte II con procedimientos legales, factores de riesgo e información
+societaria del trimestre) antes de guardarlo como fuente — mismo
+criterio de "corpus manejable" que ya regía el diseño context-stuffing
+del chat (ver "Chat experto sobre earnings: viabilidad y diseño"),
+evitando meter ~700KB de boilerplate legal sin valor para responder
+preguntas de un usuario. Guardado en
+`docs/premium/hyperscalers/AMZN_fuentes/` junto con el comunicado y las
+slides completos (sin recortar, son mucho más cortos).
+
+`docs/premium/hyperscalers/AMZN.md` sigue la misma estructura y nivel de
+detalle educativo que MSFT.md (analogías para conceptos complejos,
+sección final que distingue explícitamente qué está confirmado en el
+comunicado/10-Q de este trimestre frente a lo que solo dice el vídeo sin
+contrastar — sobre todo el crecimiento interanual exacto del backlog, la
+afirmación de capacidad de 2027-2028 ya vendida, y la comparación de
+concentración de clientes frente a Microsoft, todas cosas que
+normalmente se dicen en la llamada de resultados con analistas, de la
+que esta vez no se dispuso). Regla de "quitar referencias al canal,
+presentador y patrocinadores" aplicada igual que en MSFT.
+
+Verificado con `AppTest`: la pestaña AMZN de "Contenido Premium" carga
+sin excepciones, muestra la cabecera con logo + el análisis completo, y
+el chat aparece habilitado (`premium_chat.build_corpus("AMZN")` ya no
+devuelve `None`, arma ~350.000 caracteres de contexto). Probado también
+el clic de una pregunta sugerida para AMZN con una clave de Anthropic
+falsa: sin excepciones, fallo de API capturado con gracia por el
+`try/except` existente, igual que ya se había verificado para MSFT.
+
+Pendiente: GOOGL y META, cuando el usuario pase el material de cada uno
+(la transcripción de Google que llegó por el mix-up de esta sesión NO se
+ha usado ni guardado para un futuro `GOOGL.md` — el usuario no la
+proporcionó con esa intención, y usarla igualmente habría sido actuar
+sobre una suposición no confirmada).
+
+### Tercer análisis entregado: GOOGL, con las cuatro fuentes oficiales por primera vez (2026-09-03)
+
+El usuario pasó el material de Google/Alphabet en un mensaje aparte,
+esta vez sin ninguna ambigüedad: cuatro PDF (`2026q2-alphabet-earnings-
+release.pdf`, `goog-20260630.pdf` el Form 10-Q, `2026_Q2_Earnings_
+Transcript.pdf` y `2026q2-alphabet-earnings-slides.pdf`) más la
+transcripción del vídeo correcta de Google (la que en la sesión anterior
+había llegado por error adjunta al mensaje de Amazon). Confirmados los
+cuatro PDF como genuinos de Alphabet vía `pdftotext` antes de escribir
+nada, siguiendo la misma disciplina de verificación que en AMZN.
+
+**Primera vez con las cuatro fuentes oficiales del trimestre a la vez**
+(comunicado, 10-Q, transcripción de la earnings call Y slides — para
+MSFT solo se tuvo comunicado+transcripción, para AMZN solo
+comunicado+10-Q+slides sin transcripción). Esto permitió verificar
+prácticamente cualquier cifra citada por el vídeo, y detectar con
+precisión los pocos puntos donde el vídeo se desvía de las fuentes:
+
+1. **Dos probables errores de transcripción automática del vídeo
+   original, corregidos con la cifra oficial**: el gasto en intereses
+   pasó de 261 a 1.278 millones de dólares (el vídeo decía "12.278
+   millones", un orden de magnitud de más — típico fallo de
+   speech-to-text al perder una coma decimal), y la porción de deuda
+   con vencimiento a 12 meses es de 1.999 millones de dólares, no
+   "199.000 millones" como se entendía del vídeo.
+2. **Una atribución del vídeo que el 10-Q no respalda**: el vídeo
+   atribuye la ganancia de "empresa no cotizada" (dentro de los 99.031
+   millones de dólares de revalorización de acciones que infla el BPA a
+   9,11 $) a Anthropic. El 10-Q de Alphabet, en las dos ocasiones en que
+   menciona el origen de esa ganancia, dice únicamente "SpaceX and a
+   private company" — nunca nombra a Anthropic. Es una atribución
+   externa razonable (es de dominio público que Google invierte en
+   Anthropic), pero no confirmada en los documentos oficiales de este
+   trimestre, así que se señaló como no verificada en vez de darla por
+   buena.
+3. **Un matiz de precisión entre backlog total y backlog de Cloud**: el
+   vídeo dice "514.000 millones de backlog de Google Cloud", que es
+   correcto (513.900 millones exactos), pero es distinto del backlog
+   *total* de Alphabet (519.500 millones) — se documentó la diferencia
+   explícitamente, mismo criterio que ya se aplicó en MSFT con el RPO
+   comercial vs. total.
+
+**Lección central del vídeo, preservada en el análisis**: a diferencia
+de MSFT y AMZN (donde el foco era desmontar el beneficio neto y el
+escudo fiscal), aquí la lección estructurante es que el mercado cotiza
+expectativas futuras, no resultados pasados — Alphabet presentó
+crecimiento del 24% en ingresos y el 82% en Cloud, pero la acción cayó
+un 7% por la combinación de una segunda subida de guía de Capex 2026 (a
+195.000-205.000 millones de dólares) y el aviso, sin cifras concretas,
+de que el Capex de 2027 "aumentará significativamente" — contrastado
+explícitamente en `GOOGL.md` con el mensaje más concreto que dio Amazon
+sobre su capacidad de 2027-2028 ya vendida, para explicar por qué el
+mercado reaccionó de forma tan distinta a dos guías de inversión
+igualmente enormes.
+
+**Recorte del 10-Q**: a diferencia del de Amazon (que sí incluye una
+sección de factores de riesgo extensa), el 10-Q de Alphabet incorpora la
+mayoría de sus factores de riesgo por referencia a su 10-K anual, así
+que la sección de riesgos propia del trimestre es corta — el recorte
+(hasta el inicio del Item 6 "Exhibits") dejó fuera solo el listado de
+exhibits, certificaciones y firmas, conservando prácticamente todo el
+contenido informativo del documento (~3.700 de 3.895 líneas).
+
+Verificado con `AppTest`: la pestaña GOOGL de "Contenido Premium" carga
+sin excepciones, muestra la cabecera con logo + el análisis completo, y
+el chat aparece habilitado (`premium_chat.build_corpus("GOOGL")` arma
+~434.000 caracteres de contexto — el corpus más grande de los tres
+hasta ahora, por incluir la transcripción de la earnings call además del
+10-Q). Probado también el clic de una pregunta sugerida con una clave de
+Anthropic falsa: sin excepciones, fallo de API capturado con gracia.
+
+Pendiente: META, cuando el usuario pase el material.
+
+### Cuarto y último análisis de esta tanda: META (2026-09-03)
+
+El usuario pasó el material de Meta en un mensaje aparte: cuatro PDF
+(`META-Q2-2026-Earnings-Call-Transcript.pdf`, `META-Q2-2026-Follow-Up-
+Call-Transcript.pdf` —una sesión de Q&A adicional que Meta celebra aparte
+de la llamada principal, novedad frente a los otros tres hyperscalers—,
+`Earnings-Presentation-Q2-2026.pdf` y `Meta-06-30-2026-Exhibit-99-1-
+FINAL.pdf`, el comunicado oficial) más la transcripción del vídeo.
+Confirmados los cuatro PDF como genuinos de Meta Platforms vía
+`pdftotext` antes de escribir nada, mismo protocolo que en los tres
+análisis anteriores.
+
+**Sin Form 10-Q esta vez** (a diferencia de AMZN y GOOGL): se dispuso de
+comunicado + dos transcripciones de llamada + slides, pero no del
+informe trimestral ante la SEC. Esto dejó varias cifras muy concretas
+del vídeo sin poder verificarse —los compromisos de compra a largo plazo
+por 349.310M$, el porcentaje exacto de participación de Meta (20%, según
+el vídeo) en sus centros de datos conjuntos con terceros (Hyperion con
+Blue Owl en Luisiana, la nueva alianza con BlackRock en El Paso) y la
+cifra de "un billón de dólares" como posible cuantía de las demandas por
+daño a menores— todas suelen aparecer en las notas de compromisos y
+contingencias del 10-Q, documentado explícitamente como limitación en
+`META.md` en vez de darlas por buenas.
+
+**Estructura del análisis, distinta a los tres anteriores**: en MSFT,
+AMZN y GOOGL había que *restar* ganancias excepcionales que inflaban el
+beneficio (revalorización de participaciones en Anthropic/SpaceX/otras).
+En META es el caso inverso — hay que restar **gastos** excepcionales que
+lo hunden artificialmente (2.400M$ de cargos legales + 1.180M$ de
+indemnizaciones por el recorte de plantilla de mayo de 2026), algo que
+la propia Meta confirma con una cita textual en su comunicado:
+"excluyendo estos cargos, el beneficio operativo habría crecido un 9%
+interanual" — a diferencia de Amazon/Alphabet, Meta no publica un BPA
+"limpio" ya calculado, así que el análisis reproduce el cálculo con las
+cifras oficiales. El verdadero punto de riesgo del trimestre no está en
+el beneficio contable sino en el flujo de caja libre, que se desplomó un
+91% interanual (de 8.549M$ a 784M$) porque el Capex se llevó el 97,5%
+del efectivo operativo — y, a diferencia de AWS/Google Cloud, Meta no
+tiene ningún backlog que enseñar porque, de momento, no vende ni alquila
+capacidad de cómputo como negocio.
+
+**Error de transcripción detectado y corregido** (mismo patrón que en
+GOOGL): el vídeo cita la partida de gastos acumulados de hace un año en
+torno a "-117 millones de dólares"; el dato oficial confirmado en el
+estado de flujos de caja es -1.107 millones de dólares — con toda
+probabilidad, el mismo tipo de error de transcripción automática por
+pérdida de una coma decimal ya visto en `GOOGL.md`.
+
+Verificado con `AppTest`: la pestaña META de "Contenido Premium" carga
+sin excepciones, muestra la cabecera con logo + el análisis completo, y
+el chat aparece habilitado (`premium_chat.build_corpus("META")` arma
+~199.000 caracteres de contexto). Probado también el clic de una
+pregunta sugerida con una clave de Anthropic falsa: sin excepciones,
+fallo de API capturado con gracia. Confirmado además que ya no queda
+ningún hyperscaler en estado "en preparación" en la página — los 4
+(MSFT, AMZN, GOOGL, META) tienen análisis completo.
+
+**Con esto se completa la primera tanda de hyperscalers** planteada en
+"Apartado de pago: análisis en detalle de hyperscalers" más arriba.
+Pendiente, fuera de esta tanda: NVDA y SPX en la sección "Próximamente"
+de la misma página, todavía sin material del usuario.
+
+### META: segunda pasada con el 10-Q real (2026-09-03)
+
+El usuario aportó información adicional sobre META en un mensaje aparte:
+`Downloadable-BS-Q2-26.xlsx` y `Downloadable-PL-Q2-26.xlsx` (balance y
+cuenta de resultados históricos multi-trimestre, coinciden exactamente
+con las cifras ya usadas) y, sobre todo, `Q10.pdf` — el Form 10-Q real
+de Meta que faltaba en el análisis inicial y que había dejado varios
+puntos del vídeo marcados como "no verificados" en `META.md`.
+
+Confirmado el 10-Q como genuino vía `pdftotext` y usado para resolver,
+con cifra oficial, exactamente los puntos que se habían señalado como
+pendientes:
+- **349.310 millones de dólares en compromisos de compra no
+  cancelables** (53.520M$ en 2026, 81.650M$ en 2027), más ~278.990
+  millones en arrendamientos ya firmados pero sin empezar, más 68.000
+  millones adicionales firmados en julio de 2026 (hecho posterior
+  revelado en el propio 10-Q) — confirma la cifra exacta de 349.310M$
+  que citaba el vídeo, y sitúa en el orden de magnitud correcto (aunque
+  no idénticas) las cifras de "~200.000M$ en leasing" y "+50.000M$ en
+  julio".
+- **20% de participación de Meta** en ambas alianzas de infraestructura
+  fuera de balance (Hyperion/Luisiana con Blue Owl, ~27.000M$ de coste
+  total estimado; El Paso con BlackRock) — coincide exactamente con la
+  cifra del vídeo.
+- **"Más de un billón de dólares"**: cita textual del propio 10-Q sobre
+  la cuantía que los demandantes reclaman en ciertos casos del litigio
+  multidistrito por adicción de menores a redes sociales — confirma
+  literalmente la cifra que el vídeo atribuía a este litigio. El 10-Q
+  aporta además contexto no citado por el vídeo: veredictos ya emitidos
+  este mismo trimestre (6M$ en el primer juicio piloto de Los Ángeles,
+  375M$ de sanción civil en Nuevo México + 953M$ reclamados en
+  reparación) y el calendario de próximos juicios.
+- **El procedimiento antimonopolio de la Comisión Europea sobre la API
+  de WhatsApp Business**: confirmado con todo detalle (investigación
+  abierta en diciembre de 2025, medida provisional de acceso gratuito
+  impuesta en junio de 2026, Meta recurriendo) — exactamente el caso que
+  mencionaba el vídeo.
+
+`META.md` se actualizó in situ (no se reescribió desde cero): se movieron
+los puntos de la sección "no verificado" a "confirmado" con la cifra
+oficial y contexto adicional, se añadió una sección de riesgo nueva
+("Los compromisos de compra a largo plazo, ahora con cifra oficial") y
+se amplió la sección de cargos legales con el detalle de litigios y la
+investigación antimonopolio. `META_fuentes/10q_q2fy2026.md` se añadió
+siguiendo el mismo criterio de recorte que en AMZN/GOOGL (fuera firmas,
+certificaciones y listado de exhibits; dentro estados financieros, MD&A
+y factores de riesgo — en el caso de Meta, a diferencia de Alphabet, sí
+hay una sección de riesgos extensa, similar a la de Amazon).
+
+Verificado con `AppTest`: el corpus del chat de META
+(`premium_chat.build_corpus("META")`) pasó de ~199.000 a ~664.000
+caracteres tras añadir el 10-Q — el corpus más grande de los cuatro
+hyperscalers, por incluir tanto las dos transcripciones de llamada como
+la sección de riesgos legales completa. Sin excepciones.
+
+## Comparador de gráficos: dos acciones en un mismo gráfico (2026-09-05)
+
+El usuario quiso dar más profundidad al apartado free (no premium) del
+dashboard con un comparador visual: elegir dos tickers cualquiera del
+universo y ver su evolución en el mismo gráfico, **independientemente de
+las predicciones del modelo** — no es una vista de predicción/backtest,
+es puramente exploratoria sobre `daily_prices`.
+
+**Decisión de diseño — normalizar el precio, no usar el nivel crudo**:
+comparar dos acciones con escalas de precio muy distintas (ej. NVDA
+~180$ vs. una acción de 20$) en el mismo eje Y no es legible, una
+aplasta a la otra. Se indexa el cierre de cada ticker a 100 en el primer
+día de la ventana seleccionada (equivalente a mostrar el % de cambio
+desde el inicio) — es el estándar habitual para gráficos de comparación
+multi-activo. Recomendación mía, aceptada sin objeción por el usuario.
+
+**Alcance decidido por el usuario (vía `AskUserQuestion`)**:
+- **v1: solo precio normalizado.** Explícitamente pidió preparar la
+  implementación para dos extensiones futuras sin tener que reescribir:
+  un panel de indicadores técnicos comparados (RSI, volatilidad...) y un
+  KPI de correlación entre las dos series — ninguna de las dos se
+  construye todavía.
+- **Página nueva** en la navegación superior (no una pestaña dentro de
+  "Predicciones"), para que quede claramente separada de la lógica de
+  predicción.
+
+**Implementación** (`dashboard/views/comparador.py`, registrada en
+`Inicio.py` como "Comparador", 7ª página): reutiliza el patrón ya
+existente en `predicciones.py` (selector sector→ticker, cabecera con
+logo, `go.Figure()`/`go.Scatter()` con la paleta de `ui.py`), pero
+factorizado en `_ticker_selector()` para no duplicar la lógica de filtro
+por sector al llamarse dos veces (una por acción, con `key` distinto
+para no colisionar en el estado de Streamlit). Colores: `#1D4ED8` (azul,
+acción A) y `#0B0F19` (negro, acción B) — se descartó `#1E3A8A` (azul
+marino) como color B porque queda demasiado parecido al azul principal
+en el mismo gráfico. Si los dos tickers elegidos coinciden, se muestra
+un aviso y se corta la ejecución (`st.stop()`) en vez de dibujar un
+gráfico con una sola serie.
+
+Para las dos acciones se llama `da.get_price_history()` dos veces (una
+por ticker) en vez de añadir un `get_price_history_multi()` a
+`data_access.py` — con solo 2 tickers y ~2.500 filas/ticker el impacto
+de rendimiento es marginal, y no complicar `data_access.py` para un caso
+de uso tan puntual.
+
+**Puntos de extensión dejados a propósito, sin implementar**
+(`_render_technical_panel()` y `_render_correlation_kpi()`, ambas
+lanzan `NotImplementedError` con un docstring explicando qué harían):
+el panel técnico reutilizaría `da.get_gold_train_for_ticker()` (ya
+calcula `rsi_14`, `volatility_10d`, `macd_line`, etc. por ticker, sin
+recalcular nada nuevo); el KPI de correlación se calcularía sobre los
+retornos diarios de las mismas series de precio ya cargadas
+(`df_a["close"].pct_change().corr(df_b["close"].pct_change())`), sin
+necesitar datos adicionales.
+
+Verificado con `AppTest` contra la base real de 208 tickers: `Inicio.py`
+carga sin excepciones con la 7ª página registrada; `comparador.py` solo
+también carga sin excepciones, con el selector A por defecto en NVDA
+(`default_ticker_index`) y el selector B cayendo en el primer ticker
+distinto de A; el gráfico Plotly se renderiza (`plotly_chart` presente);
+y el caso de mismo ticker en A y B muestra el aviso y no revienta.

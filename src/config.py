@@ -314,3 +314,46 @@ NEWS_RAW_DIR = DATA_DIR / "raw" / "news"
 # logos (no rompe nada) — ver `dashboard/data_access.ticker_logo_url()`.
 # Consíguela gratis (sin tarjeta) en https://www.logo.dev/signup.
 LOGO_DEV_TOKEN = os.environ.get("LOGO_DEV_TOKEN", "")
+
+# --- Chat de "Contenido Premium" (2026-08-31) ---
+# Petición del usuario: un chat experto por hyperscaler para resolver
+# dudas sobre sus resultados, usando como contexto los documentos
+# oficiales de cada trimestre y el análisis ya redactado (nunca la
+# transcripción del vídeo de terceros — ver CONTEXTO.md, "Chat experto
+# sobre earnings: viabilidad y diseño"). A diferencia de LOGO_DEV_TOKEN,
+# esta SÍ es una clave secreta de servidor (API key de Anthropic, con
+# coste por token) — nunca debe ir a un <img> ni exponerse al cliente.
+# Sin ella configurada, `dashboard/premium_chat.py` deja el chat
+# deshabilitado con un aviso, no rompe el resto del dashboard.
+# Clave en https://console.anthropic.com/ (requiere cuenta con billing).
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+
+# Opcional — SOLO hace falta si tu ANTHROPIC_API_KEY es una "personal key"
+# o "service account key" sin workspace fijado al crearla (Claude Console
+# > Settings > API keys > Linked account: tú, sin marcar un workspace
+# concreto). Esas claves son "identity-linked" y la API exige indicar en
+# qué workspace opera cada petición vía la cabecera
+# `anthropic-workspace-id` — si no se manda, la API devuelve el error 400
+# "anthropic-workspace-id is required when authenticating with an
+# identity-linked API key". Se encuentra en Claude Console > Settings >
+# Workspaces > columna "ID" (empieza por `wrkspc_`). Si tu clave SÍ está
+# ligada a un workspace concreto (o es una "workspace key" clásica), deja
+# esto vacío — no hace falta y así te ahorras tener que mantenerlo.
+ANTHROPIC_WORKSPACE_ID = os.environ.get("ANTHROPIC_WORKSPACE_ID", "")
+
+# Modelo barato y rápido a propósito: esto es preguntas y respuestas
+# ancladas a unos pocos documentos concretos, no una tarea que necesite
+# el modelo más potente — ver CONTEXTO.md sobre el control de coste de
+# esta función, expuesta sin login todavía.
+PREMIUM_CHAT_MODEL = "claude-haiku-4-5-20251001"
+
+# Límite de preguntas por sesión de navegador (contador en
+# st.session_state, se reinicia si el usuario recarga la página) y límite
+# global por día (contador en un fichero local aparte, ver
+# `dashboard/premium_chat.py` — única excepción documentada a la regla de
+# "el dashboard nunca escribe nada", y solo para este fichero de conteo,
+# nunca para stocker.db). Ambos existen porque el chat SÍ tiene coste por
+# pregunta, a diferencia del resto del dashboard, y la página de
+# Contenido Premium es pública sin autenticación todavía.
+PREMIUM_CHAT_MAX_PER_SESSION = 10
+PREMIUM_CHAT_MAX_PER_DAY_GLOBAL = 150

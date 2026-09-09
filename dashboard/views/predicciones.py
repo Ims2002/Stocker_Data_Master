@@ -98,6 +98,28 @@ except FileNotFoundError:
     )
     st.stop()
 
+# Trazabilidad del modelo activo para este horizonte (2026-09-10,
+# feedback de un tutor: "no queda claro... si día, semana y mes utilizan
+# modelos realmente evaluados para cada horizonte" — ver CONTEXTO.md
+# "Feedback de un tutor: comunicación de predicciones poco concluyentes,
+# trazabilidad y consistencia del sentimiento"). Los tres horizontes SÍ
+# entrenan y evalúan un modelo independiente (ver `model.py --horizon`),
+# pero esa evidencia vivía solo en "¿Funciona de verdad?", una pestaña
+# distinta sin ningún enlace desde aquí desde el 2026-08-30 — se deja
+# visible en el propio sitio donde se muestra la predicción, no solo
+# "encontrable" si ya sabes que esa otra pestaña existe.
+with st.container(border=True):
+    st.caption(
+        f"Predicción del modelo `{bundle.get('_model_version', '?')}` ({bundle.get('model_type', '?')}), "
+        f"entrenado el {bundle.get('trained_at', 'fecha desconocida')[:10] if bundle.get('trained_at') else 'fecha desconocida'} "
+        f"y evaluado con un examen real ({bundle.get('test_date_min', '?')} a {bundle.get('test_date_max', '?')}, "
+        f"nunca visto en entrenamiento) — un modelo distinto por horizonte, no el mismo reutilizado."
+    )
+    st.page_link(
+        "views/rendimiento_del_modelo.py",
+        label="Ver el rendimiento completo y la calibración de este modelo →", icon="📊",
+    )
+
 prices = da.get_price_history(engine, ticker, months=meses)
 gold = da.get_gold_train_for_ticker(engine, ticker, months=meses)
 
@@ -197,13 +219,13 @@ with st.container(border=True):
         # mostrada para la dirección equivocada"): `predicted_probability`
         # guarda SIEMPRE P(sube), no la probabilidad de la dirección
         # predicha — con "Baja" mostraba p.ej. "35%" que un usuario lee
-        # como "35% de bajar" cuando en realidad son 65%. Se muestra la
-        # confianza en la dirección predicha (`p` si sube, `1-p` si
-        # baja), mismo criterio que ya usaba
-        # `data_access.get_confidence_accuracy`.
-        confianza = (
-            latest_pred["predicted_probability"] if latest_pred["predicted_target_up_down"] == 1
-            else 1 - latest_pred["predicted_probability"]
+        # como "35% de bajar" cuando en realidad son 65%.
+        # `da.prediction_confidence()` (2026-09-10) consolida esta cuenta,
+        # antes duplicada en cada página. (El aviso de "poco concluyente"
+        # que hubo en el KPI de dirección se revirtió a petición del
+        # usuario el mismo día — ver CONTEXTO.md.)
+        confianza = da.prediction_confidence(
+            latest_pred["predicted_target_up_down"], latest_pred["predicted_probability"]
         )
         col2.metric(
             "Probabilidad estimada", f"{confianza:.1%}",
@@ -227,7 +249,7 @@ with st.container(border=True):
         elif gold_eval.empty:
             st.caption(
                 "En la ventana elegida no hay días de \"examen real\" — prueba a ampliar los meses de "
-                "histórico, o consulta la página 'Rendimiento del modelo' para el dato oficial."
+                "histórico, o consulta la página '¿Funciona de verdad?' para el dato oficial."
             )
     else:
         col3.metric("Aciertos en la ventana", "sin datos")
@@ -235,5 +257,16 @@ with st.container(border=True):
 st.caption(
     "Los aciertos/fallos de este gráfico son solo de esta acción, para hacerte una idea visual — el "
     "número oficial (calculado con todas las acciones a la vez, de forma más rigurosa) está en la página "
-    "'Rendimiento del modelo'."
+    "'¿Funciona de verdad?'."
+)
+
+st.divider()
+# Mismo pie de trazabilidad que Dashboard (2026-09-10, feedback de un
+# tutor — ver CONTEXTO.md "Feedback de un tutor: comunicación de
+# predicciones poco concluyentes, trazabilidad y consistencia del
+# sentimiento").
+st.caption(
+    "Todas las cifras de esta página salen de `stocker.db`, generado por el pipeline real "
+    "(`download.py → load.py → gold.py → model.py → predict.py`, ver `docs/entregas/` para el detalle "
+    "metodológico) — el dashboard nunca escribe ni inventa datos."
 )

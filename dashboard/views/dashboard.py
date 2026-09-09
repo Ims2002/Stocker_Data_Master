@@ -271,12 +271,16 @@ with st.container(border=True):
         direccion = "📈 Sube" if latest_pred["predicted_target_up_down"] == 1 else "📉 Baja"
         col1.metric(f"Predicción · {latest_pred['date_predicha']}", direccion)
         # Bug corregido 2026-09-09 (ver CONTEXTO.md "Probabilidad
-        # mostrada para la dirección equivocada" / "predicciones.py" tiene
-        # el mismo comentario en detalle): `predicted_probability` guarda
-        # SIEMPRE P(sube), no la probabilidad de la dirección predicha.
-        confianza = (
-            latest_pred["predicted_probability"] if latest_pred["predicted_target_up_down"] == 1
-            else 1 - latest_pred["predicted_probability"]
+        # mostrada para la dirección equivocada"): `predicted_probability`
+        # guarda SIEMPRE P(sube), no la probabilidad de la dirección
+        # predicha — `da.prediction_confidence()` ya lo ajusta.
+        # (2026-09-10: se probó además marcar como "poco concluyente" la
+        # dirección cuando la confianza cae por debajo del 55%, ver
+        # CONTEXTO.md "Feedback de un tutor: comunicación de predicciones
+        # poco concluyentes..." — el usuario pidió revertirlo, así que
+        # "Sube"/"Baja" se muestra siempre, sin ese aviso.)
+        confianza = da.prediction_confidence(
+            latest_pred["predicted_target_up_down"], latest_pred["predicted_probability"]
         )
         col2.metric(
             "Probabilidad estimada", f"{confianza:.1%}",
@@ -352,7 +356,21 @@ with st.container(border=True):
                 }]
             }
             st_echarts(options=gauge_option, height="110px")
-            st.caption(f"Sentimiento de mercado: **{market_gauge['label']}** ({market_gauge['n_articles']} art.)")
+            # Alcance/ventana explícitos en el propio texto (2026-09-10,
+            # feedback de un tutor: dos cifras de nº de artículos en la
+            # misma página sin explicar por qué difieren — ver
+            # CONTEXTO.md "Feedback de un tutor: comunicación de
+            # predicciones poco concluyentes, trazabilidad y consistencia
+            # del sentimiento"). Este número es de TODO el universo
+            # (208 tickers) en los últimos `n_dias` días naturales — muy
+            # distinto del de "Lectura rápida" más abajo, que es de UN
+            # solo ticker en el último mes. Antes ninguno de los dos
+            # decía su alcance, así que parecían inconsistentes entre sí
+            # sin serlo (miden cosas distintas a propósito).
+            st.caption(
+                f"Sentimiento de mercado (todo el universo, últimos {market_gauge['n_dias']} días): "
+                f"**{market_gauge['label']}** ({market_gauge['n_articles']} art.)"
+            )
         else:
             st.caption("Sentimiento de mercado: sin datos todavía.")
 
@@ -460,10 +478,11 @@ with st.container(border=True):
     if latest_pred and latest_pred["predicted_target_up_down"] is not None:
         direccion_txt = "**subirá**" if latest_pred["predicted_target_up_down"] == 1 else "**bajará**"
         # Mismo fix que en el KPI de arriba: confianza en la dirección
-        # predicha, no P(sube) en crudo.
-        confianza_txt = (
-            latest_pred["predicted_probability"] if latest_pred["predicted_target_up_down"] == 1
-            else 1 - latest_pred["predicted_probability"]
+        # predicha, no P(sube) en crudo. (2026-09-10: el aviso de "poco
+        # concluyente" que hubo aquí se revirtió a petición del usuario —
+        # ver CONTEXTO.md.)
+        confianza_txt = da.prediction_confidence(
+            latest_pred["predicted_target_up_down"], latest_pred["predicted_probability"]
         )
         partes.append(
             f"El modelo predice que **{ticker}** {direccion_txt} en el horizonte "
@@ -478,7 +497,13 @@ with st.container(border=True):
         n_art = int(daily_sent["n_articles"].sum())
         tono = float((daily_sent["avg_sentiment_score"] * daily_sent["n_articles"]).sum() / n_art) if n_art else 0.0
         tono_label = da.sentiment_scalar_label(tono)
-        partes.append(f"Las noticias de {ticker} del último mes tienen un tono **{tono_label.lower()}** ({n_art} artículos).")
+        # "de SOLO esta acción" explícito (2026-09-10, ver comentario del
+        # caption de "Sentimiento de mercado" más arriba) — para que no
+        # se lea como comparable al nº de artículos de todo el universo.
+        partes.append(
+            f"Las noticias de **solo {ticker}** en el último mes tienen un tono **{tono_label.lower()}** "
+            f"({n_art} artículos de {ticker}, no de todo el mercado)."
+        )
     else:
         partes.append(f"Sin noticias recientes de {ticker} en el último mes.")
 
@@ -487,3 +512,18 @@ with st.container(border=True):
         "Texto generado a partir de los mismos datos de arriba — el sentimiento de noticias es "
         "informativo, sin evidencia de que ayude a predecir el precio (ver CONTEXTO.md)."
     )
+
+st.divider()
+# Pie de trazabilidad del pipeline (2026-09-10, feedback de un tutor:
+# "falta demostrar que las cifras y funcionalidades que muestra pueden
+# salir realmente del pipeline" — ver CONTEXTO.md "Feedback de un tutor:
+# comunicación de predicciones poco concluyentes, trazabilidad y
+# consistencia del sentimiento"). Barato de mantener honesto: no dice
+# nada que no sea ya cierto en el resto del proyecto, solo lo hace
+# visible en la propia página en vez de asumir que quien la mira ya
+# conoce el repositorio.
+st.caption(
+    "Todas las cifras de esta página salen de `stocker.db`, generado por el pipeline real "
+    "(`download.py → load.py → gold.py → model.py → predict.py`, ver `docs/entregas/` para el detalle "
+    "metodológico) — el dashboard nunca escribe ni inventa datos."
+)

@@ -641,6 +641,21 @@ def get_accuracy_by_volatility(engine: Engine, bundle: dict) -> pd.DataFrame:
     )
 
 
+def prediction_confidence(predicted_target_up_down: int, predicted_probability: float) -> float:
+    """Confianza en la DIRECCIÓN PREDICHA concreta, no en "sube" a secas
+    (2026-09-09, ver CONTEXTO.md "Probabilidad mostrada para la dirección
+    equivocada"). `predictions.predicted_probability` guarda SIEMPRE
+    P(sube) — con `predicted_target_up_down=0` ("baja"), mostrar ese
+    valor sin ajustar es literalmente el número equivocado (un 35% de
+    P(sube) son en realidad 65% de confianza en "baja"). Antes de esta
+    función, la misma fórmula (`p if sube else 1-p`) estaba duplicada en
+    `dashboard.py` (dos veces) y `predicciones.py` — consolidada aquí
+    como fuente única, mismo criterio que ya usaba
+    `get_confidence_accuracy` con `np.maximum(proba_up, 1 - proba_up)`
+    (equivalente cuando se conoce ya la clase predicha)."""
+    return predicted_probability if predicted_target_up_down == 1 else 1 - predicted_probability
+
+
 def get_confidence_accuracy(engine: Engine, bundle: dict, threshold: float = 0.6) -> dict | None:
     """Compara el acierto (test oficial) de TODAS las predicciones frente
     al del subconjunto de "alta confianza" (probabilidad a favor de la

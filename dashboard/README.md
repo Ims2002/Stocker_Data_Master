@@ -70,8 +70,16 @@ streamlit run ...` lo evita siempre.)
   claude.ai".
 - **`data_access.py`** — toda la lógica de acceso a datos vive aquí, no
   en las páginas. Reutiliza `src/db.py`, `src/model.py`
-  (`build_feature_matrix`, `FEATURE_NAMES`) y `src/predict.py`
-  (`latest_model_path`) en vez de duplicar esa lógica.
+  (`build_feature_matrix`, `FEATURE_NAMES`, `calibration_diagnostic`) y
+  `src/predict.py` (`latest_model_path`) en vez de duplicar esa lógica.
+  `prediction_confidence()` (2026-09-10, ver CONTEXTO.md "Feedback de un
+  tutor: comunicación de predicciones poco concluyentes...") consolida
+  en un solo sitio la conversión de `predicted_probability` (siempre
+  P(sube)) a confianza en la dirección predicha, antes duplicada en
+  `dashboard.py`/`predicciones.py`. (La constante
+  `CONFIANZA_POCO_CONCLUYENTE_UMBRAL` que acompañaba a esta función se
+  quitó el mismo día — ver más abajo, el usuario revirtió el aviso de
+  "poco concluyente" que la usaba.)
 - **`views/dashboard.py`** (nuevo, 2026-08-25; recortado el mismo día
   tras el primer feedback; página de ENTRADA del v1 desde el 2026-08-27)
   — "Dashboard": implementación del mockup tipo SaaS aprobado por el
@@ -107,6 +115,19 @@ streamlit run ...` lo evita siempre.)
   pulir el Plotly existente. Ver CONTEXTO.md, "Segunda pasada revertida +
   librería de gráficos para el semicírculo" y "Semicírculo de
   sentimiento: librería nueva (`streamlit-echarts`, 2026-08-30)".
+  **2026-09-10** (feedback de un tutor, ver CONTEXTO.md "Feedback de un
+  tutor: comunicación de predicciones poco concluyentes..."): el caption
+  del medidor de sentimiento de mercado declara explícitamente su
+  alcance ("todo el universo, últimos N días") y el de "Lectura rápida"
+  el suyo ("solo {ticker}"), para que dos cifras de nº de artículos con
+  ventanas distintas no se lean como inconsistentes entre sí; y un pie
+  de página nuevo enlaza el pipeline real (`download.py → ... →
+  predict.py`) que genera cada cifra de la página. Se probó también
+  marcar como "⚖️ Poco concluyente" el KPI de predicción y "Lectura
+  rápida" cuando la confianza caía por debajo del 55% (en vez de
+  "📈 Sube"/"📉 Baja") — el usuario pidió revertirlo el mismo día, así
+  que ambos vuelven a mostrar siempre la dirección predicha sin ese
+  aviso (ver CONTEXTO.md para el detalle del revert).
 - **`views/inicio.py`** (página "Resumen" — YA NO registrada en el v1,
   ver Inicio.py) — primera versión de un dashboard unificado
   (2026-08-13, ampliado 2026-08-18, ver CONTEXTO.md): KPIs generales +
@@ -126,7 +147,15 @@ streamlit run ...` lo evita siempre.)
   modelo entrenado desde 2026-08-18) + gráfico histórico con el
   backtest del modelo superpuesto sobre ese ticker, marcando dónde
   empieza el test real (nunca visto en entrenamiento) para no confundir
-  precisión "informativa" con la métrica oficial.
+  precisión "informativa" con la métrica oficial. **2026-09-10**
+  (feedback de un tutor, ver CONTEXTO.md): caption de trazabilidad justo
+  debajo del selector con `model_version`/fecha de entrenamiento/ventana
+  de test del modelo activo para el horizonte elegido, más un
+  `st.page_link` hacia "¿Funciona de verdad?" — antes esa evidencia solo
+  existía en otra pestaña sin ningún enlace desde aquí. Mismo pie de
+  trazabilidad del pipeline al final de la página que Dashboard (el
+  aviso de "⚖️ Poco concluyente" que se probó el mismo día en el KPI de
+  predicción se revirtió a petición del usuario — ver CONTEXTO.md).
 - **`views/importancia_de_features.py`** — importancia global de
   features (una sola, compartida por todos los tickers — el modelo no
   usa el ticker como feature).

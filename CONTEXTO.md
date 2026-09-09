@@ -2197,14 +2197,147 @@ presentación.
 
 ### Reentrenamiento de los tres horizontes tras el fix de leakage
 
-Pendiente de ejecutar y documentar aquí con cifras reales — bloqueado en
-el momento de escribir esto por un fallo de infraestructura del sandbox
-de este agente (el propio contenedor de shell no arrancaba, error de
-montaje ajeno al proyecto). En cuanto se pueda ejecutar
-`python src/gold.py` (si hace falta) + `python src/model.py --horizon
-1/5/20` + `python src/predict.py --horizon 1/5/20`, se documenta aquí la
-comparación de accuracy/Brier score antes vs. después del fix, honesta
-en cualquier sentido (si el fix baja la accuracy de test porque
-eliminaba una fuga que la inflaba artificialmente, ES el resultado
-correcto a reportar, no algo a esconder — mismo criterio de
-"Honestidad de resultado" de siempre).
+El sandbox de este agente se quedó atascado toda la sesión del
+2026-09-09 (fallo de infraestructura de montaje, ajeno al proyecto, sin
+recuperarse tras varios reintentos) — el propio usuario reentrenó los
+tres modelos en su máquina (`random_forest_h1_20260909170008.joblib`,
+`random_forest_h5_20260909170149.joblib`,
+`random_forest_h20_20260909170312.joblib`, los tres con el fix de purga
+ya aplicado) y ejecutó `predict.py --horizon 1/5/20` él mismo, siguiendo
+los comandos exactos que se le indicaron. Los tres `.joblib` están en
+`models/` y las predicciones ya están regeneradas.
+
+**Comparación de accuracy/Brier score antes vs. después del fix, sigue
+pendiente de documentar aquí** — el sandbox seguía atascado también
+cuando llegó el segundo bloque de feedback del tutor (ver sección
+siguiente), así que no se ha podido todavía leer el contenido de los
+`.joblib` nuevos ni correr `AppTest` para confirmar que el dashboard los
+consume sin excepciones. En cuanto el entorno se recupere, se completa
+esta sección con las cifras reales — honestas en cualquier sentido: si
+el fix baja la accuracy de test porque eliminaba una fuga que la
+inflaba artificialmente, ES el resultado correcto a reportar, no algo a
+esconder (mismo criterio de "Honestidad de resultado" de siempre).
+
+## Feedback de un tutor: comunicación de predicciones poco concluyentes, trazabilidad y consistencia del sentimiento (2026-09-10)
+
+Segundo bloque de feedback del mismo tutor, esta vez sobre una única
+captura de pantalla del dashboard (no sobre el repositorio ni el código
+— importante, porque dos de los cinco puntos ya estaban parcialmente
+cubiertos por el fix del día anterior sin que el tutor lo supiera al
+mirar solo una imagen):
+
+> "El dashboard permite entender rápido qué acción se analiza y qué
+> predice el sistema, pero la entrega está incompleta: solo has aportado
+> una captura y no el Markdown ni el repositorio que permitan justificar
+> el flujo y contrastar el frontal con los datos y el modelo real. Hay
+> además un problema importante de comunicación: una probabilidad del
+> 50,8% es prácticamente ausencia de señal y no debería presentarse en
+> grande simplemente como "Sube"; sería más honesto indicar que la
+> predicción es poco concluyente. Tampoco queda claro cómo se ha
+> validado el histórico de aciertos/fallos ni si día, semana y mes
+> utilizan modelos realmente evaluados para cada horizonte. Revisa
+> también la consistencia del sentimiento: aparecen 181 artículos en una
+> zona y 1.049 en la lectura rápida sin explicar por qué cambia la
+> muestra. El diseño visual es utilizable, pero falta demostrar que las
+> cifras y funcionalidades que muestra pueden salir realmente del
+> pipeline."
+
+Antes de tocar nada se planteó el plan completo al usuario (regla del
+proyecto: preguntar ante la duda) y se resolvieron dos decisiones de
+producto explícitas vía `AskUserQuestion` — desarrollado solo después.
+
+**1. "Solo una captura, falta el Markdown/repositorio"**: no es un bug
+de código. `docs/entregas/` ya tiene los 4 documentos de la entrega,
+`04_analisis_modelado.md` ya actualizado con las correcciones del día
+anterior. Decisión del usuario: compartir con el tutor un repositorio
+con acceso de lectura (no un zip) — no requiere ningún cambio en el
+dashboard.
+
+**2. "50,8% no debería presentarse en grande como 'Sube'"** — el punto
+más accionable. Se añade un umbral de "predicción poco concluyente"
+(decisión del usuario: **55% de confianza** — coherente con que el
+baseline de clase mayoritaria ya ronda el 51-52%, así que por debajo de
+ese umbral casi no hay señal real por encima del azar). Nueva constante
+compartida `data_access.CONFIANZA_POCO_CONCLUYENTE_UMBRAL = 0.55` y
+función `data_access.prediction_confidence()` (ver punto siguiente).
+Por debajo del umbral, "📈 Sube"/"📉 Baja" se sustituye por
+"⚖️ Poco concluyente" en los tres sitios donde se muestra una predicción
+(KPI de Dashboard, KPI de Predicciones, texto de "Lectura rápida") — sin
+ocultar hacia qué lado se inclina el modelo, solo sin presentarlo como
+una dirección clara cuando no lo es.
+
+**Hallazgo de refactor al implementar el punto 2**: la fórmula
+`p if sube else 1-p` (el fix del día anterior para el bug de dirección
+equivocada) estaba duplicada tres veces (dos en `dashboard.py`, una en
+`predicciones.py`). Se consolidó en `data_access.prediction_confidence()`
+— única fuente de verdad, mismo criterio que ya usaba
+`get_confidence_accuracy` (`np.maximum(proba_up, 1-proba_up)`).
+
+**3. "No queda claro cómo se ha validado el histórico ni si cada
+horizonte tiene modelo evaluado propio"** — la evidencia SÍ existe (cada
+horizonte entrena y evalúa un modelo independiente, visible en
+"¿Funciona de verdad?"), pero vivía en una pestaña sin ningún enlace
+desde "Predicciones" desde que se quitó el 2026-08-30. Fix: caption
+nueva justo debajo del selector de ticker/horizonte en "Predicciones"
+con `model_version`, tipo de modelo, fecha de entrenamiento y ventana de
+test real (`bundle.get(...)`, ya disponible, no hace falta calcular
+nada nuevo) + `st.page_link` hacia "¿Funciona de verdad?". De paso se
+corrigieron dos referencias de texto en `predicciones.py` que seguían
+llamando a esa página "Rendimiento del modelo" (su nombre de archivo/
+título interno antiguo) en vez de "¿Funciona de verdad?" (su título real
+en la navegación) — inconsistencia menor pero real, encontrada al
+revisar este punto.
+
+**4. "181 artículos en una zona y 1.049 en la lectura rápida"** — causa
+encontrada: son dos métricas distintas sin declarar su alcance. El "art."
+del medidor de sentimiento de mercado (KPI de Dashboard) es la suma de
+TODOS los tickers (208) en los últimos `n_dias` días naturales
+(`get_market_sentiment_gauge`, ventana de 7 días); el de "Lectura
+rápida" es la suma de UN SOLO ticker en el último MES
+(`get_daily_sentiment_for_ticker`, 1 mes). Ninguna de las dos cifras
+está mal calculada — el problema es que ninguna decía su alcance, así
+que dos números grandes y cercanos en la misma pantalla se leían como si
+debieran coincidir. Fix: ambos captions ahora declaran explícitamente
+alcance + ventana ("todo el universo, últimos N días" vs. "solo
+{ticker}... {N} artículos de {ticker}, no de todo el mercado").
+
+**5. "Falta demostrar que las cifras salen del pipeline real"** — se
+añadió un pie de página discreto en Dashboard y Predicciones: "Todas las
+cifras de esta página salen de `stocker.db`, generado por el pipeline
+real (`download.py → load.py → gold.py → model.py → predict.py`...)" —
+para que una captura suelta ya se autodocumente mínimamente, sin
+depender de que quien la mire conozca el repositorio de antemano.
+
+**Verificación pendiente**: el sandbox de este agente seguía sin
+recuperarse cuando se implementó este bloque — los cinco cambios se
+revisaron manualmente línea a línea (vía lectura directa de los
+archivos, sin poder ejecutar Python) en vez de con `AppTest`. Falta
+confirmar con `AppTest` en cuanto el entorno se recupere: que los
+`page_link`/`switch_page` no rompen la navegación, y que ninguna página
+revienta con los tres modelos nuevos ya en `models/`.
+
+### Revert: "poco concluyente" (punto 2) vuelve a la versión anterior (2026-09-10, mismo día)
+
+El usuario pidió explícitamente deshacer el punto 2 tras verlo — sin dar
+más motivo, así que no se ha asumido ninguno; si hace falta un umbral o
+un tratamiento distinto para "poco concluyente" más adelante, es una
+conversación aparte, no una reimplementación automática de lo mismo.
+
+**Revertido**: en `dashboard.py` (KPI de predicción + texto de "Lectura
+rápida") y `predicciones.py` (KPI de predicción), se quita la
+bifurcación que sustituía "📈 Sube"/"📉 Baja" por "⚖️ Poco concluyente"
+por debajo del 55% de confianza — las tres vistas vuelven a mostrar
+siempre la dirección predicha tal cual, sin ese aviso. La constante
+`data_access.CONFIANZA_POCO_CONCLUYENTE_UMBRAL` se elimina (quedaba sin
+ningún uso).
+
+**NO revertido, a propósito**: `data_access.prediction_confidence()` se
+queda — no es parte de "poco concluyente", es el fix del punto anterior
+(2026-09-09, "Probabilidad mostrada para la dirección equivocada") que
+corrige que `predicted_probability` guarda siempre P(sube) y no la
+probabilidad de la dirección mostrada; revertirlo reintroduciría ese bug
+real. Tampoco se han tocado los otros tres puntos de este mismo bloque
+de feedback (caption de trazabilidad del modelo en Predicciones,
+etiquetado de alcance/ventana del sentimiento, pie de página del
+pipeline) — el usuario pidió deshacer específicamente "el poco
+concluyente", no el resto del bloque.

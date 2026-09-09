@@ -202,13 +202,42 @@ FEATURE_NAMES = [
 ]
 
 
-def temporal_split(df: pd.DataFrame, test_period_months: int = TEST_PERIOD_MONTHS) -> tuple[pd.DataFrame, pd.DataFrame]:
+def temporal_split(
+    df: pd.DataFrame, test_period_months: int = TEST_PERIOD_MONTHS, purge_sessions: int = 0,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Split cronológico único y global (no por ticker, no aleatorio): los
     últimos `test_period_months` meses de fecha (sobre TODO el panel) son
-    test, el resto train."""
+    test, el resto train.
+
+    `purge_sessions` (2026-09-09, ver CONTEXTO.md "Leakage en el split de
+    horizontes 5/20: purga de sesiones antes del corte", feedback de un
+    tutor): fuga de datos real detectada en horizontes >1. El target de
+    una fila fechada `d` se construye en `gold.py` como
+    `close.shift(-horizon)` — es decir, el cierre `horizon` SESIONES
+    después de `d`. Con `purge_sessions=0` (comportamiento antiguo), una
+    fila de TRAIN justo antes del corte puede tener una etiqueta
+    calculada con un cierre que ya cae DENTRO del periodo de test: para
+    horizonte 5, la fila fechada `cutoff - 5 sesiones` tiene como target
+    el cierre de exactamente `cutoff` (ya es test). El modelo aprendería
+    así, indirectamente, del movimiento de precio real del periodo que se
+    supone que no ha visto — no es que vea filas de test, pero SÍ ve
+    etiquetas construidas con precios de test. Con horizonte 20 el efecto
+    es peor (hasta 20 sesiones de solape).
+
+    Fix: purgar del train las `purge_sessions` sesiones de mercado
+    inmediatamente anteriores al corte (`purge_sessions = horizon` en los
+    llamadores) — así ninguna fila de train conserva una etiqueta que
+    dependa de un cierre `>= cutoff`. Se aplica también a horizonte 1
+    (purga de 1 sola sesión) por consistencia, aunque ahí el solape era
+    de una sola sesión y el efecto práctico es mínimo (~208 filas de
+    ~510k). El test NO se purga — sigue siendo `date >= cutoff` tal
+    cual, sin cambios."""
     max_date = pd.Timestamp(df["date"].max())
     cutoff = (max_date - pd.DateOffset(months=test_period_months)).date()
-    train = df[df["date"] < cutoff].copy()
+    train_dates = np.sort(df.loc[df["date"] < cutoff, "date"].unique())
+    if purge_sessions > 0:
+        train_dates = train_dates[:-purge_sessions] if len(train_dates) > purge_sessions else train_dates[:0]
+    train = df[df["date"].isin(set(train_dates))].copy()
     test = df[df["date"] >= cutoff].copy()
     return train, test
 
@@ -231,6 +260,78 @@ def evaluate(y_true: np.ndarray, y_pred: np.ndarray) -> dict:
         "precision": precision_score(y_true, y_pred, zero_division=0),
         "recall": recall_score(y_true, y_pred, zero_division=0),
     }
+
+
+def calibration_diagnostic(y_true, proba_up: np.ndarray, n_bins: int = 10) -> dict | None:
+    """Diagnóstico de calibración de `predicted_probability` sobre un
+    conjunto de test ya resuelto (2026-09-09, ver CONTEXTO.md
+    "Calibración de predicted_probability", feedback de un tutor: "esa
+    probabilidad no está necesariamente calibrada, así que no la
+    vendería como confianza sin comprobar calibración").
+
+    Se comprueba la CONFIANZA en la clase predicha
+    (`max(proba_up, 1 - proba_up)`), no `proba_up` en crudo — es
+    literalmente lo que se le enseña al usuario junto a la dirección
+    predicha en el dashboard (ver `dashboard/views/dashboard.py` y
+    `predicciones.py`, y `data_access.get_confidence_accuracy`, que ya
+    usaba este mismo criterio de "confianza" desde antes). Si el modelo
+    estuviera bien calibrado, un grupo de predicciones con confianza
+    declarada del 60% debería acertar ~60% de las veces, ni más ni menos.
+
+    Devuelve:
+    - `brier_score`: Brier score clásico (`proba_up` vs. el resultado
+      real 0/1 de "sube") — 0 es perfecto, 0.25 es lo que da predecir
+      siempre 0.5 (el peor caso "no informativo" con clases balanceadas).
+    - `reliability_table`: lista de cubos (por defecto `n_bins`,
+      percentiles de confianza) con nº de casos, confianza media
+      declarada y acierto real observado en ese cubo — la tabla/gráfico
+      de fiabilidad que hace visible si "confianza" es una palabra
+      honesta aquí o no.
+
+    None si no hay datos suficientes para al menos 2 cubos distintos
+    (no debería pasar con el tamaño real del test, pero evita reventar
+    con conjuntos de prueba minúsculos)."""
+    from sklearn.metrics import brier_score_loss
+
+    y = np.asarray(y_true).astype(int)
+    proba_up = np.asarray(proba_up, dtype=float)
+    if len(y) < 2 * n_bins:
+        return None
+
+    brier = float(brier_score_loss(y, proba_up))
+
+    confianza = np.maximum(proba_up, 1 - proba_up)
+    pred_label = (proba_up >= 0.5).astype(int)
+    acierto = (pred_label == y).astype(int)
+
+    try:
+        bin_idx = pd.qcut(confianza, q=n_bins, duplicates="drop", labels=False)
+    except ValueError:
+        return {"brier_score": brier, "reliability_table": []}
+
+    tabla = pd.DataFrame({"bin_idx": bin_idx, "confianza": confianza, "acierto": acierto})
+    resumen = (
+        tabla.groupby("bin_idx")
+        .agg(
+            n=("acierto", "size"),
+            confianza_media=("confianza", "mean"),
+            confianza_min=("confianza", "min"),
+            confianza_max=("confianza", "max"),
+            acierto_real=("acierto", "mean"),
+        )
+        .reset_index(drop=True)
+    )
+    reliability_table = [
+        {
+            "n": int(row.n),
+            "confianza_media": float(row.confianza_media),
+            "confianza_min": float(row.confianza_min),
+            "confianza_max": float(row.confianza_max),
+            "acierto_real": float(row.acierto_real),
+        }
+        for row in resumen.itertuples()
+    ]
+    return {"brier_score": brier, "reliability_table": reliability_table}
 
 
 def _build_model(model_type: str):
@@ -272,13 +373,19 @@ def train_and_evaluate(
     ticker, que sí están en `gold_train` (con el target a 1 sesión
     relleno) pero no tienen suficiente futuro para el horizonte largo (ver
     `gold.build_gold_frames`). Las features son las mismas para todos los
-    horizontes; solo cambia qué se le pide adivinar al modelo."""
+    horizontes; solo cambia qué se le pide adivinar al modelo.
+
+    `purge_sessions=horizon` (2026-09-09, ver CONTEXTO.md "Leakage en el
+    split de horizontes 5/20"): se pasa siempre el propio horizonte a
+    `temporal_split` — es la cantidad exacta de sesiones cuya etiqueta,
+    de no purgarse, se solaparía con el periodo de test (ver docstring de
+    `temporal_split`)."""
     if horizon not in HORIZON_COLUMNS:
         raise ValueError(f"horizon desconocido: {horizon!r} (válidos: {sorted(HORIZON_COLUMNS)})")
     target_col = HORIZON_COLUMNS[horizon][1]
     df = df[df[target_col].notna()].copy()
 
-    train_df, test_df = temporal_split(df)
+    train_df, test_df = temporal_split(df, purge_sessions=horizon)
     if train_df.empty or test_df.empty:
         raise ValueError(
             "Split temporal vacío (train o test): ¿hay suficiente histórico "
@@ -294,6 +401,7 @@ def train_and_evaluate(
     model = _build_model(model_type)
     model.fit(x_train, y_train)
     y_pred_model = model.predict(x_test)
+    proba_up_test = model.predict_proba(x_test)[:, 1]
 
     y_pred_majority = majority_baseline(y_train, len(y_test))
     y_pred_persistence = persistence_baseline(test_df)
@@ -311,10 +419,13 @@ def train_and_evaluate(
         "metrics_model": evaluate(y_test, y_pred_model),
         "metrics_majority_baseline": evaluate(y_test, y_pred_majority),
         "metrics_persistence_baseline": evaluate(y_test, y_pred_persistence),
+        "calibration": calibration_diagnostic(y_test, proba_up_test),
     }
 
 
-def _time_series_folds(df: pd.DataFrame, n_splits: int = 3) -> list[tuple[pd.Series, pd.Series]]:
+def _time_series_folds(
+    df: pd.DataFrame, n_splits: int = 3, purge_sessions: int = 0,
+) -> list[tuple[pd.Series, pd.Series]]:
     """Cortes cronológicos (ventana creciente / walk-forward) para tuning
     de hiperparámetros, DENTRO del train oficial únicamente (nunca ve el
     test real). Un k-fold aleatorio normal (p. ej. `StratifiedKFold`,
@@ -329,6 +440,16 @@ def _time_series_folds(df: pd.DataFrame, n_splits: int = 3) -> list[tuple[pd.Ser
     "predecir el futuro cercano a partir de todo el pasado disponible
     hasta ese punto", igual que el problema real.
 
+    `purge_sessions` (2026-09-09, ver CONTEXTO.md "Leakage en el split de
+    horizontes 5/20"): MISMO problema que en `temporal_split` pero en
+    cada frontera train/validación de cada fold, no solo en el corte
+    final train/test — las últimas filas del bloque de train de un fold
+    pueden tener una etiqueta (horizonte >1) construida con precios que
+    ya caen dentro del bloque de validación de ese mismo fold. Se purgan
+    las últimas `purge_sessions` sesiones de cada bloque de train (los
+    bloques ya vienen ordenados cronológicamente por construcción, así
+    que basta con recortar el final del array concatenado).
+
     Devuelve máscaras booleanas (no arrays de posiciones) para poder
     indexar `df` directamente con `df[mask]` sin depender de que el
     índice esté reseteado."""
@@ -336,9 +457,11 @@ def _time_series_folds(df: pd.DataFrame, n_splits: int = 3) -> list[tuple[pd.Ser
     blocks = np.array_split(dates, n_splits + 1)
     folds = []
     for i in range(n_splits):
-        train_dates = set(np.concatenate(blocks[: i + 1]))
+        train_dates = np.concatenate(blocks[: i + 1])
+        if purge_sessions > 0:
+            train_dates = train_dates[:-purge_sessions] if len(train_dates) > purge_sessions else train_dates[:0]
         val_dates = set(blocks[i + 1])
-        train_mask = df["date"].isin(train_dates)
+        train_mask = df["date"].isin(set(train_dates))
         val_mask = df["date"].isin(val_dates)
         folds.append((train_mask, val_mask))
     return folds
@@ -403,14 +526,18 @@ def tune_lightgbm(
     target_col = HORIZON_COLUMNS[horizon][1]
     df = df[df[target_col].notna()].copy()
 
-    train_df, test_df = temporal_split(df)
+    train_df, test_df = temporal_split(df, purge_sessions=horizon)
     if train_df.empty or test_df.empty:
         raise ValueError(
             "Split temporal vacío (train o test): ¿hay suficiente histórico "
             f"en gold_train (horizonte={horizon}) para separar los últimos {TEST_PERIOD_MONTHS} meses?"
         )
 
-    folds = _time_series_folds(train_df, n_splits=n_splits)
+    # purge_sessions=horizon también en cada frontera train/validación de
+    # los folds de tuning (2026-09-09, ver docstring de _time_series_folds
+    # y CONTEXTO.md "Leakage en el split de horizontes 5/20") — mismo
+    # problema, mismo fix, en cada fold interno de la búsqueda.
+    folds = _time_series_folds(train_df, n_splits=n_splits, purge_sessions=horizon)
     rng = np.random.default_rng(random_state)
 
     best_params: dict | None = None
@@ -441,6 +568,7 @@ def tune_lightgbm(
     final_model = _make_lgbm(best_params, random_state)
     final_model.fit(x_train, y_train)
     y_pred_model = final_model.predict(x_test)
+    proba_up_test = final_model.predict_proba(x_test)[:, 1]
 
     y_pred_majority = majority_baseline(y_train, len(y_test))
     y_pred_persistence = persistence_baseline(test_df)
@@ -458,6 +586,7 @@ def tune_lightgbm(
         "metrics_model": evaluate(y_test, y_pred_model),
         "metrics_majority_baseline": evaluate(y_test, y_pred_majority),
         "metrics_persistence_baseline": evaluate(y_test, y_pred_persistence),
+        "calibration": calibration_diagnostic(y_test, proba_up_test),
         "best_params": best_params,
         "cv_best_val_accuracy": best_score,
         "tuning_trials": trials,
@@ -507,6 +636,7 @@ def save_model(result: dict) -> tuple[str, Path]:
         "metrics_model": result["metrics_model"],
         "metrics_majority_baseline": result["metrics_majority_baseline"],
         "metrics_persistence_baseline": result["metrics_persistence_baseline"],
+        "calibration": result.get("calibration"),
         "trained_at": datetime.now().isoformat(),
     }
     if "best_params" in result:
@@ -539,6 +669,20 @@ def print_report(result: dict) -> None:
             f"[model]   {label:<28} acc={m['accuracy']:.3f}  prec={m['precision']:.3f}  rec={m['recall']:.3f}",
             file=sys.stderr,
         )
+    calibration = result.get("calibration")
+    if calibration:
+        print(
+            "[model] --- calibración de predicted_probability (ver CONTEXTO.md, "
+            "'Calibración de predicted_probability') ---",
+            file=sys.stderr,
+        )
+        print(f"[model]   brier_score={calibration['brier_score']:.4f} (0=perfecto, 0.25=no informativo)", file=sys.stderr)
+        for b in calibration["reliability_table"]:
+            print(
+                f"[model]   confianza {b['confianza_min']:.2f}-{b['confianza_max']:.2f} "
+                f"(media {b['confianza_media']:.2f}, n={b['n']:>4}) -> acierto real {b['acierto_real']:.2f}",
+                file=sys.stderr,
+            )
 
     beats_majority = result["metrics_model"]["accuracy"] > result["metrics_majority_baseline"]["accuracy"]
     beats_persistence = result["metrics_model"]["accuracy"] > result["metrics_persistence_baseline"]["accuracy"]

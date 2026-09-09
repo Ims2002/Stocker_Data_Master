@@ -39,6 +39,30 @@ gráficos: dos acciones en un mismo gráfico"): "Comparador"
 (views/comparador.py) — parte del apartado free, independiente de
 predicción/backtest, deja elegir dos tickers y ver su precio normalizado
 en un mismo gráfico.
+
+CAMBIOS 2026-09-08 (ver CONTEXTO.md, "Quitar '¿Funciona de verdad?' y
+profundizar en noticias desde el Dashboard"):
+- Se QUITA "¿Funciona de verdad?" (views/rendimiento_del_modelo.py) de
+  la navegación — el archivo NO se borra, solo deja de registrarse aquí,
+  mismo criterio que el resto de páginas recortadas del v1.
+- Se REINCORPORA "Noticias de la acción" (views/sentimiento_por_accion.py)
+  — el motivo por el que se había quitado en el recorte del v1 de arriba
+  (backfill de noticias todavía en marcha) ya no aplica: el backfill
+  está completo (208/208 tickers). Reincorporada porque el Dashboard solo
+  enseña un recorte de 4 titulares y el usuario pidió poder profundizar
+  desde ahí — ver el botón "Ver todas las noticias →" en
+  views/dashboard.py. "Sentimiento del mercado"
+  (views/sentimiento_del_mercado.py) se queda fuera por ahora, no se pidió.
+
+REINCORPORADA OTRA VEZ 2026-09-09 (ver CONTEXTO.md, "Calibración de
+predicted_probability" y "Leakage en el split de horizontes 5/20",
+feedback de un tutor del TFM): "¿Funciona de verdad?"
+(views/rendimiento_del_modelo.py) vuelve a la navegación — motivo
+distinto al que la quitó el día anterior. Ahora incluye una sección de
+calibración (curva de fiabilidad + Brier score sobre el test real) que
+responde directamente al feedback de no vender `predicted_probability`
+como "confianza" sin comprobarlo. También gana selector de horizonte
+(antes solo mostraba el horizonte día).
 """
 
 from __future__ import annotations
@@ -63,6 +87,7 @@ pages = [
     st.Page("views/importancia_de_features.py", title="En qué se fija"),
     st.Page("views/rendimiento_del_modelo.py", title="¿Funciona de verdad?"),
     st.Page("views/seguimiento_real.py", title="Día a día"),
+    st.Page("views/sentimiento_por_accion.py", title="Noticias de la acción"),
     st.Page("views/premium.py", title="Contenido Premium", icon="🔒"),
 ]
 pg = st.navigation(pages, position="top")

@@ -193,7 +193,26 @@ with st.container(border=True):
     if latest_pred and latest_pred["predicted_target_up_down"] is not None:
         direccion = "📈 Sube" if latest_pred["predicted_target_up_down"] == 1 else "📉 Baja"
         col1.metric(f"Predicción para {latest_pred['date_predicha']}", direccion)
-        col2.metric("Probabilidad estimada", f"{latest_pred['predicted_probability']:.1%}")
+        # Bug corregido 2026-09-09 (ver CONTEXTO.md "Probabilidad
+        # mostrada para la dirección equivocada"): `predicted_probability`
+        # guarda SIEMPRE P(sube), no la probabilidad de la dirección
+        # predicha — con "Baja" mostraba p.ej. "35%" que un usuario lee
+        # como "35% de bajar" cuando en realidad son 65%. Se muestra la
+        # confianza en la dirección predicha (`p` si sube, `1-p` si
+        # baja), mismo criterio que ya usaba
+        # `data_access.get_confidence_accuracy`.
+        confianza = (
+            latest_pred["predicted_probability"] if latest_pred["predicted_target_up_down"] == 1
+            else 1 - latest_pred["predicted_probability"]
+        )
+        col2.metric(
+            "Probabilidad estimada", f"{confianza:.1%}",
+            help=(
+                "Probabilidad que el modelo asigna a ESTA dirección concreta. Es la salida cruda de "
+                "Random Forest — no está garantizado que esté calibrada como una probabilidad real de "
+                "acierto (ver la calibración comprobada en '¿Funciona de verdad?')."
+            ),
+        )
     else:
         col1.metric(f"Predicción ({horizonte_label})", "—")
         col2.metric("Probabilidad estimada", "—")

@@ -7,6 +7,18 @@ página de rendimiento del modelo: la investigación del mismo día
 encontró que esta señal ayude a predecir la dirección del precio, así que
 esta página no debe insinuar que sí. Vive en views/, no pages/ — ver nota
 en views/inicio.py sobre por qué.
+
+REINCORPORADA A LA NAVEGACIÓN 2026-09-08 (ver CONTEXTO.md, "Quitar
+'¿Funciona de verdad?' y profundizar en noticias desde el Dashboard"): se
+había quitado del v1 (2026-08-27) porque el backfill de Alpha Vantage
+todavía estaba en marcha — ya está completo (208/208 tickers). Se vuelve
+a registrar porque el Dashboard solo enseña un recorte de 4 titulares en
+su caja de noticias y el usuario pidió poder profundizar desde ahí: el
+botón "Ver todas las noticias →" de `views/dashboard.py` guarda el ticker
+elegido en `st.session_state["noticias_ticker"]` antes de navegar aquí —
+si esa clave existe, se usa para preseleccionar el ticker (en vez de caer
+al ticker por defecto) y se descarta con `.pop()` para no dejarla
+pegada en visitas futuras directas desde la navegación.
 """
 
 from __future__ import annotations
@@ -56,6 +68,8 @@ coverage = _coverage()
 meta_tickers = _tickers_by_sector()
 sectores = ["Todos"] + sorted(meta_tickers["sector"].dropna().unique().tolist())
 
+_preselect = st.session_state.pop("noticias_ticker", None)
+
 col_s, col_t = st.columns([1, 2])
 with col_s:
     sector = st.selectbox("Sector", sectores, index=0)
@@ -63,8 +77,12 @@ tickers_filtrados = (
     tickers if sector == "Todos"
     else [t for t in tickers if t in set(meta_tickers.loc[meta_tickers["sector"] == sector, "ticker"])]
 ) or tickers
+if _preselect in tickers_filtrados:
+    _default_idx = tickers_filtrados.index(_preselect)
+else:
+    _default_idx = da.default_ticker_index(tickers_filtrados)
 with col_t:
-    ticker = st.selectbox("Ticker", tickers_filtrados, index=da.default_ticker_index(tickers_filtrados))
+    ticker = st.selectbox("Ticker", tickers_filtrados, index=_default_idx)
 meta = da.get_ticker_metadata(engine, ticker)
 st.caption(
     f"**{meta.get('nombre') or ticker}** · {meta.get('sector') or 'sector desconocido'} · "

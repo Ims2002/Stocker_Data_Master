@@ -85,6 +85,34 @@ semicírculo ahora se dibuja con `st_echarts()` en vez de
 CONTEXTO.md, "Semicírculo de sentimiento: librería nueva
 (`streamlit-echarts`, 2026-08-30)".
 
+ENLACE A "NOTICIAS DE LA ACCIÓN" 2026-09-08 (ver CONTEXTO.md, "Quitar
+'¿Funciona de verdad?' y profundizar en noticias desde el Dashboard"):
+la caja de "Últimas noticias de {ticker}" solo enseña 4 titulares
+recortados (limit=4, ver `_recent_articles()` más abajo) — a propósito,
+es una cabecera, no el lugar para profundizar. Debajo se añade un botón
+"Ver todas las noticias →" que guarda el ticker elegido en
+`st.session_state["noticias_ticker"]` y navega con `st.switch_page()` a
+"Noticias de la acción" (views/sentimiento_por_accion.py, reincorporada
+a la navegación el mismo día) — esa página lee y consume esa clave para
+preseleccionar el mismo ticker, en vez de caer al ticker por defecto
+(NVDA). No se usó `st.page_link` (el patrón ya existente en el resto del
+dashboard para enlazar entre páginas) porque `st.page_link` no ejecuta
+código Python al pulsarse — no hay forma de pasarle el ticker elegido;
+`st.button` + `st.switch_page()` sí permite fijar el session_state justo
+antes de cambiar de página.
+
+LECTURA RÁPIDA A TODO EL ANCHO 2026-09-08 (mismo día, ver CONTEXTO.md
+"Quitar '¿Funciona de verdad?' y profundizar en noticias desde el
+Dashboard"): al añadir el botón "Ver todas las noticias →" dentro de
+`col_side`, esa columna estrecha (noticias + botón + antes también
+"Lectura rápida", los tres apilados) quedó más alta que `col_chart`
+—reintrodujo el scroll vertical en 1920x1080 que el rediseño del
+2026-08-30 ("Rediseño de layout: sin scroll en 1920x1080") había
+eliminado a propósito. Fix: "Lectura rápida" sale de `col_side` y pasa a
+ser su propia fila a todo el ancho, debajo de las dos columnas
+(gráfico | noticias), en vez de apilada dentro de la columna estrecha —
+reparte mejor el alto total de la página y vuelve a caber sin scroll.
+
 Vive en views/, no pages/ — ver la nota en views/inicio.py sobre por qué.
 """
 
@@ -242,7 +270,22 @@ with st.container(border=True):
     if latest_pred and latest_pred["predicted_target_up_down"] is not None:
         direccion = "📈 Sube" if latest_pred["predicted_target_up_down"] == 1 else "📉 Baja"
         col1.metric(f"Predicción · {latest_pred['date_predicha']}", direccion)
-        col2.metric("Probabilidad estimada", f"{latest_pred['predicted_probability']:.1%}")
+        # Bug corregido 2026-09-09 (ver CONTEXTO.md "Probabilidad
+        # mostrada para la dirección equivocada" / "predicciones.py" tiene
+        # el mismo comentario en detalle): `predicted_probability` guarda
+        # SIEMPRE P(sube), no la probabilidad de la dirección predicha.
+        confianza = (
+            latest_pred["predicted_probability"] if latest_pred["predicted_target_up_down"] == 1
+            else 1 - latest_pred["predicted_probability"]
+        )
+        col2.metric(
+            "Probabilidad estimada", f"{confianza:.1%}",
+            help=(
+                "Probabilidad que el modelo asigna a ESTA dirección concreta. Salida cruda de Random "
+                "Forest, sin garantía de estar calibrada como confianza real (ver calibración en "
+                "'¿Funciona de verdad?')."
+            ),
+        )
     else:
         col1.metric("Predicción", "—")
         col2.metric("Probabilidad estimada", "—")
@@ -401,30 +444,46 @@ with col_side:
                 )
             st.markdown("".join(items_html), unsafe_allow_html=True)
 
-    st.markdown("**Lectura rápida**")
-    with st.container(border=True, height=200):
-        partes = []
-        if latest_pred and latest_pred["predicted_target_up_down"] is not None:
-            direccion_txt = "**subirá**" if latest_pred["predicted_target_up_down"] == 1 else "**bajará**"
-            partes.append(
-                f"El modelo predice que **{ticker}** {direccion_txt} en el horizonte "
-                f"**{horizonte_label.lower()}**, con una probabilidad estimada del "
-                f"**{latest_pred['predicted_probability']:.0%}**."
-            )
-        else:
-            partes.append(f"Todavía no hay una predicción guardada para **{ticker}** en este horizonte.")
+    if st.button("Ver todas las noticias →", width="stretch"):
+        st.session_state["noticias_ticker"] = ticker
+        st.switch_page("views/sentimiento_por_accion.py")
 
-        daily_sent = _daily_sentiment(ticker)
-        if not daily_sent.empty:
-            n_art = int(daily_sent["n_articles"].sum())
-            tono = float((daily_sent["avg_sentiment_score"] * daily_sent["n_articles"]).sum() / n_art) if n_art else 0.0
-            tono_label = da.sentiment_scalar_label(tono)
-            partes.append(f"Las noticias de {ticker} del último mes tienen un tono **{tono_label.lower()}** ({n_art} artículos).")
-        else:
-            partes.append(f"Sin noticias recientes de {ticker} en el último mes.")
-
-        st.markdown(" ".join(partes))
-        st.caption(
-            "Texto generado a partir de los mismos datos de arriba — el sentimiento de noticias es "
-            "informativo, sin evidencia de que ayude a predecir el precio (ver CONTEXTO.md)."
+# --- Lectura rápida: a todo el ancho, debajo de las dos columnas (no
+# dentro de col_side) — ver docstring del módulo, "Lectura rápida a todo
+# el ancho". Al meter el botón "Ver todas las noticias →" en col_side,
+# esa columna quedó más alta que col_chart y reintrodujo scroll vertical
+# en 1920x1080; sacar este bloque a una fila propia de ancho completo
+# reparte mejor el alto total de la página.
+st.markdown("**Lectura rápida**")
+with st.container(border=True):
+    partes = []
+    if latest_pred and latest_pred["predicted_target_up_down"] is not None:
+        direccion_txt = "**subirá**" if latest_pred["predicted_target_up_down"] == 1 else "**bajará**"
+        # Mismo fix que en el KPI de arriba: confianza en la dirección
+        # predicha, no P(sube) en crudo.
+        confianza_txt = (
+            latest_pred["predicted_probability"] if latest_pred["predicted_target_up_down"] == 1
+            else 1 - latest_pred["predicted_probability"]
         )
+        partes.append(
+            f"El modelo predice que **{ticker}** {direccion_txt} en el horizonte "
+            f"**{horizonte_label.lower()}**, con una probabilidad estimada del "
+            f"**{confianza_txt:.0%}**."
+        )
+    else:
+        partes.append(f"Todavía no hay una predicción guardada para **{ticker}** en este horizonte.")
+
+    daily_sent = _daily_sentiment(ticker)
+    if not daily_sent.empty:
+        n_art = int(daily_sent["n_articles"].sum())
+        tono = float((daily_sent["avg_sentiment_score"] * daily_sent["n_articles"]).sum() / n_art) if n_art else 0.0
+        tono_label = da.sentiment_scalar_label(tono)
+        partes.append(f"Las noticias de {ticker} del último mes tienen un tono **{tono_label.lower()}** ({n_art} artículos).")
+    else:
+        partes.append(f"Sin noticias recientes de {ticker} en el último mes.")
+
+    st.markdown(" ".join(partes))
+    st.caption(
+        "Texto generado a partir de los mismos datos de arriba — el sentimiento de noticias es "
+        "informativo, sin evidencia de que ayude a predecir el precio (ver CONTEXTO.md)."
+    )

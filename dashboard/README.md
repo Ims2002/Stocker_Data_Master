@@ -31,7 +31,13 @@ streamlit run ...` lo evita siempre.)
   una 6ª página nueva, "Contenido Premium" (`views/premium.py`, no es
   parte del recorte de arriba — ver más abajo). Desde el 2026-09-05
   registra una 7ª, "Comparador" (`views/comparador.py`, tampoco parte
-  del recorte — ver más abajo).
+  del recorte — ver más abajo). **2026-09-08**: se quita "¿Funciona de
+  verdad?" (`views/rendimiento_del_modelo.py`, mismo criterio de recorte
+  — archivo intacto, solo deja de registrarse) y se reincorpora
+  "Noticias de la acción" (`views/sentimiento_por_accion.py`, el
+  backfill de noticias que motivó quitarla ya está completo) — ver
+  CONTEXTO.md, "Quitar '¿Funciona de verdad?' y profundizar en noticias
+  desde el Dashboard".
 - **`ui.py`** — CSS del tema minimalista blanco/azul/negro (aprobado por
   el usuario a partir de mockups, 2026-08-06) y el logo real de la
   cabecera (`render_logo()`, actualizado 2026-08-28 — ver `assets/` más
@@ -124,11 +130,22 @@ streamlit run ...` lo evita siempre.)
 - **`views/importancia_de_features.py`** — importancia global de
   features (una sola, compartida por todos los tickers — el modelo no
   usa el ticker como feature).
-- **`views/rendimiento_del_modelo.py`** — modelo vs. baselines
-  obligatorios sobre el test temporal oficial. Si el `.joblib` cargado
-  no tiene métricas guardadas (modelos entrenados antes de que
-  `model.save_model()` empezara a persistirlas), lo avisa y pide
-  reentrenar en vez de mostrar datos inventados o vacíos sin explicación.
+- **`views/rendimiento_del_modelo.py`** ("¿Funciona de verdad?" — quitada
+  de la navegación el 2026-09-08, **REINCORPORADA el 2026-09-09** por un
+  motivo distinto, ver Inicio.py y CONTEXTO.md "Feedback de un tutor del
+  TFM: leakage en horizontes 5/20 y calibración de predicted_probability")
+  — modelo vs. baselines obligatorios sobre el test temporal oficial, con
+  selector de horizonte (día/semana/mes, nuevo — antes solo cargaba el
+  horizonte día). Si el `.joblib` cargado no tiene métricas guardadas
+  (modelos entrenados antes de que `model.save_model()` empezara a
+  persistirlas), lo avisa y pide reentrenar en vez de mostrar datos
+  inventados o vacíos sin explicación. Sección nueva al final,
+  "¿Es fiable la probabilidad que muestra el modelo?": Brier score +
+  curva de fiabilidad (confianza declarada vs. acierto real, calculados
+  en vivo sobre el test oficial actual vía
+  `data_access.get_calibration_diagnostic()`) — responde directamente al
+  feedback de no vender `predicted_probability` como "confianza" sin
+  comprobar calibración.
 - **`views/seguimiento_real.py`** (nuevo, 2026-08-13) — acierto REAL en
   producción (`predictions.actual_target_up_down`, rellenado por
   `src/track_predictions.py`), no backtest. Regla de oro: nunca mezcla
@@ -188,19 +205,37 @@ streamlit run ...` lo evita siempre.)
   para añadir más adelante un panel de indicadores técnicos comparados y
   un KPI de correlación entre las dos series, sin tener que rehacer la
   página.
-- **`views/sentimiento_por_accion.py`** / **`views/sentimiento_del_mercado.py`**
-  (nuevas, 2026-08-13; YA NO registradas en el v1, ver Inicio.py) —
-  cuadros de mando de noticias/sentimiento, por ticker (con el mismo
-  selector de sector que "Predicciones", añadido 2026-08-18) y agregado
-  de mercado. Puramente informativas: la investigación del mismo día
-  (CONTEXTO.md, "¿Ayuda el sentimiento de noticias a acertar más?") no
-  encontró correlación real con la dirección del precio, así que ninguna
-  de las dos insinúa que el sentimiento predice nada. Se quitaron de la
-  navegación del v1 porque dependen del backfill de Alpha Vantage (~9
-  días desde cero) y no sostienen el valor central del proyecto
-  (predicción + honestidad de resultado) — quedan los archivos para una
-  v2. Manejan el caso de tickers sin cobertura todavía mostrando un aviso
-  en vez de gráficos vacíos.
+- **`views/sentimiento_por_accion.py`** ("Noticias de la acción", nueva
+  2026-08-13; **REINCORPORADA a la navegación el 2026-09-08**, ver
+  Inicio.py y CONTEXTO.md "Quitar '¿Funciona de verdad?' y profundizar en
+  noticias desde el Dashboard") — cuadro de mando de noticias/sentimiento
+  de UN ticker: KPIs (nº artículos, tono medio, días con cobertura),
+  gráfico de tendencia (tono + volumen, eje doble) y titulares con slider
+  de relevancia mínima. Se había quitado de la navegación del v1
+  (2026-08-27) porque el backfill de Alpha Vantage todavía estaba en
+  marcha; se reincorpora porque ya está completo (208/208 tickers,
+  verificado con `da.news_coverage_status()`) y porque el Dashboard
+  pedía un sitio al que profundizar: `views/dashboard.py` tiene un botón
+  **"Ver todas las noticias →"** bajo su caja de 4 titulares que guarda
+  el ticker elegido en `st.session_state["noticias_ticker"]` y navega
+  aquí con `st.switch_page()`; esta página lee y consume esa clave
+  (`.pop()`, de un solo uso) para preseleccionar el mismo ticker en vez
+  de caer al ticker por defecto. Puramente informativa: la investigación
+  del 2026-08-13 (CONTEXTO.md, "¿Ayuda el sentimiento de noticias a
+  acertar más?") no encontró correlación real con la dirección del
+  precio, así que no insinúa que el sentimiento predice nada. Maneja el
+  caso de un ticker sin cobertura todavía mostrando un aviso en vez de
+  gráficos vacíos.
+- **`views/sentimiento_del_mercado.py`** (nueva, 2026-08-13; YA NO
+  registrada, ver Inicio.py) — mismo espíritu que la anterior pero
+  agregado de TODO el universo (KPI de cobertura del backfill, tendencia
+  de tono ponderada por volumen, ranking de tickers más positivos/
+  negativos, sentimiento medio por sector). Se quitó de la navegación
+  del v1 por la misma razón que la anterior (backfill en marcha); a
+  diferencia de "Noticias de la acción", el usuario no pidió
+  reincorporarla el 2026-09-08 (solo pidió profundizar por ticker desde
+  el Dashboard) — se queda como archivo sin registrar, candidata para una
+  v2 si se decide más adelante.
 
 **¿Por qué `views/` y no la clásica `pages/` de Streamlit?** Con
 `st.navigation()`, tener además una carpeta llamada `pages/` junto al

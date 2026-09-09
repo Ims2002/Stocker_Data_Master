@@ -31,7 +31,7 @@ sys.path.insert(0, str(_SRC_DIR))
 import db as dbmod  # noqa: E402
 import predict as predictmod  # noqa: E402
 from config import DEFAULT_PREDICTION_HORIZON, PREDICTION_HORIZONS  # noqa: E402
-from model import FEATURE_NAMES, build_feature_matrix  # noqa: E402
+from model import FEATURE_NAMES, build_feature_matrix, calibration_diagnostic  # noqa: E402
 
 # Traducciones de las features técnicas a lenguaje llano para la UI (ver
 # CONTEXTO.md — el usuario pidió explícitamente que sea entendible para un
@@ -660,6 +660,32 @@ def get_confidence_accuracy(engine: Engine, bundle: dict, threshold: float = 0.6
         "pct_alta": len(alta) / len(df) if len(df) else 0.0,
         "threshold": threshold,
     }
+
+
+def get_calibration_diagnostic(engine: Engine, bundle: dict, n_bins: int = 10) -> dict | None:
+    """Diagnóstico de calibración de `predicted_probability` sobre el
+    test oficial ACTUAL (2026-09-09, ver CONTEXTO.md "Calibración de
+    predicted_probability", feedback de un tutor: no vender la
+    probabilidad del modelo como "confianza" sin comprobar calibración).
+
+    Se calcula en vivo sobre `_test_set_predictions()` (mismo patrón que
+    `get_accuracy_by_volatility`/`get_confidence_accuracy`, no un
+    snapshot congelado del momento del entrenamiento) — así el
+    diagnóstico se mantiene fresco a medida que se acumulan más sesiones
+    de test reales, sin depender de reentrenar. `model.py` calcula la
+    misma métrica en el momento del entrenamiento (se guarda en el propio
+    `.joblib` como referencia/reporte de CLI), pero el dashboard usa esta
+    versión en vivo como fuente de verdad.
+
+    None si el bundle no tiene test set evaluable (mismo criterio que las
+    otras dos funciones de esta familia)."""
+    df = _test_set_predictions(engine, bundle)
+    if df.empty:
+        return None
+    target_col = "target_up_down" if bundle.get("horizon", DEFAULT_PREDICTION_HORIZON) == 1 else (
+        f"target_up_down_{bundle.get('horizon')}d"
+    )
+    return calibration_diagnostic(df[target_col].astype(int), df["proba_up"].to_numpy(), n_bins=n_bins)
 
 
 def get_horizon_comparison(engine: Engine) -> pd.DataFrame:

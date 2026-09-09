@@ -1990,3 +1990,221 @@ también carga sin excepciones, con el selector A por defecto en NVDA
 (`default_ticker_index`) y el selector B cayendo en el primer ticker
 distinto de A; el gráfico Plotly se renderiza (`plotly_chart` presente);
 y el caso de mismo ticker en A y B muestra el aviso y no revienta.
+
+## Quitar "¿Funciona de verdad?" y profundizar en noticias desde el Dashboard (2026-09-08)
+
+De cara al broche final del proyecto (con tiempo aún hasta la entrega),
+el usuario pidió dos cambios sobre la navegación actual, sin pasar por
+`AskUserQuestion` para el primero (instrucción directa, sin ambigüedad)
+y con una aclaración para el segundo (ver más abajo).
+
+**1. Se quita "¿Funciona de verdad?" (`views/rendimiento_del_modelo.py`)
+de la navegación.** Mismo criterio que el resto de páginas recortadas
+del v1 (ver "Roadmap v1 (MVP para publicar)"): el archivo NO se borra,
+solo deja de registrarse en `Inicio.py` — se puede recuperar añadiendo
+la línea de vuelta si hiciera falta más adelante.
+
+**2. Apartado para ver las noticias en profundidad, no solo una
+cabecera.** El pedido inicial ("haz un apartado adicional... para ver
+más en profundidad todas las noticias") era ambiguo entre construir algo
+nuevo o reutilizar páginas ya existentes — se preguntó con
+`AskUserQuestion` antes de tocar código (regla del proyecto: preguntar
+ante la duda). Hallazgo relevante para la pregunta: el backfill de
+noticias de Alpha Vantage, que en su momento (2026-08-27) era el motivo
+para quitar "Noticias de la acción" y "Sentimiento del mercado" de la
+navegación del v1, ya está completo — verificado con
+`da.news_coverage_status()`: **208/208 tickers, 194.386 artículos**. El
+usuario aclaró el flujo exacto que quería: desde el Dashboard, al hacer
+clic en el apartado de noticias, ir a otra página donde ver las noticias
+en detalle — solo por ticker, no pidió el agregado de mercado.
+
+**Implementación**:
+- `views/sentimiento_por_accion.py` ("Noticias de la acción": KPIs,
+  gráfico de tendencia, titulares con slider de relevancia — ya existía
+  completa desde el 2026-08-13, ver "Cuadros de mando de noticias y
+  sentimiento") se reincorpora a `Inicio.py` (8ª página real, aunque el
+  recuento de "página Nª" del código ya no se numera estrictamente). No
+  se reincorpora `views/sentimiento_del_mercado.py` — no se pidió, se
+  queda como estaba (archivo sin registrar).
+- `views/dashboard.py`: la caja de "Últimas noticias de {ticker}" sigue
+  enseñando solo 4 titulares (a propósito, es una cabecera) pero ahora
+  tiene debajo un botón **"Ver todas las noticias →"** que guarda el
+  ticker actualmente elegido en `st.session_state["noticias_ticker"]` y
+  navega con `st.switch_page()` a "Noticias de la acción". No se usó
+  `st.page_link` (el patrón que ya usa el resto del dashboard para
+  enlazar entre páginas, ver CONTEXTO.md más arriba) porque no ejecuta
+  código Python al pulsarse — no hay forma de pasarle el ticker elegido
+  a través de él. `st.button` + `st.switch_page()` sí permite fijar el
+  session_state justo antes de cambiar de página.
+- `views/sentimiento_por_accion.py`: al entrar, hace
+  `st.session_state.pop("noticias_ticker", None)` — si la clave existe
+  (se llegó desde el botón del Dashboard), preselecciona ese ticker en
+  el selector en vez de caer al ticker por defecto (NVDA); se usa
+  `.pop()` en vez de `.get()` para que la preselección sea de un solo
+  uso y no quede "pegada" si el usuario visita la página después
+  directamente desde la navegación superior.
+
+Verificado con `AppTest` contra la base real: las 7 páginas registradas
+(Dashboard, Predicciones, Comparador, En qué se fija, Día a día,
+Noticias de la acción, Contenido Premium) cargan sin excepciones vía
+`switch_page`; el archivo de "¿Funciona de verdad?" sigue existiendo en
+disco pero ya no aparece en la navegación. Probado el flujo completo de
+clic: en Dashboard se cambia el ticker a AAPL, se pulsa "Ver todas las
+noticias →", la app navega a "Noticias de la acción" con **AAPL ya
+preseleccionado** (no NVDA) y sin excepciones; confirmado además que
+`st.session_state["noticias_ticker"]` ya no existe tras la navegación
+(se consumió con `.pop()`).
+
+**Efecto secundario detectado y corregido el mismo día: el botón nuevo
+reintrodujo scroll en el Dashboard.** El rediseño del 2026-08-30
+("Rediseño de layout: sin scroll en 1920x1080") había comprimido
+"Dashboard" a dos columnas (gráfico | noticias + lectura rápida)
+precisamente para que cupiera sin scroll vertical en una pantalla
+1920x1080. Al añadir el botón "Ver todas las noticias →" dentro de la
+columna estrecha (`col_side`), esa columna pasó a apilar: título +
+caja de noticias (200px) + botón + "Lectura rápida" (título + caja de
+200px) — más alta que la columna del gráfico, reintroduciendo scroll.
+Pedido explícito del usuario: encajar "Lectura rápida" a todo el ancho
+inferior para eliminar ese scroll. Fix en `views/dashboard.py`: "Lectura
+rápida" sale de `col_side` y pasa a ser su propia fila a todo el ancho,
+debajo de las dos columnas (antes apilada dentro de la columna
+estrecha) — reparte mejor el alto total de la página, la columna de
+noticias vuelve a quedar más corta que la del gráfico, y "Lectura
+rápida" gana además más espacio horizontal para su texto. Verificado con
+`AppTest`: la página carga sin excepciones con el ticker por defecto y
+tras cambiar a AAPL, y el texto "Lectura rápida" aparece renderizado
+fuera de la columna estrecha.
+
+## Feedback de un tutor del TFM: leakage en horizontes 5/20 y calibración de predicted_probability (2026-09-09)
+
+Un tutor revisó el proyecto y devolvió dos puntos concretos, ambos
+tratados el mismo día:
+
+> "Hay, eso sí, un punto importante de leakage que debes corregir en la
+> validación para horizontes de 5 y 20 sesiones: calculas el target
+> antes del split, así que las últimas filas del train pueden tener una
+> etiqueta construida con precios que ya pertenecen al periodo de test.
+> Necesitas purgar del train al menos las N sesiones anteriores al corte
+> para cada horizonte. Revisaría también cómo presentas
+> predicted_probability: en Random Forest esa probabilidad no está
+> necesariamente calibrada, así que no la vendería como "confianza" sin
+> comprobar calibración."
+
+### 1. Leakage en el split de horizontes 5/20: purga de sesiones antes del corte
+
+El tutor tenía razón, y el bug era real y concreto. `gold.py` calcula el
+target de cada horizonte como `close.shift(-horizon)` — el cierre
+`horizon` SESIONES después de la fecha de la fila — ANTES de que
+`model.py` haga ningún split. `temporal_split()` (el corte train/test) y
+`_time_series_folds()` (los folds walk-forward del tuning de LightGBM)
+cortaban solo por la fecha de la FILA, sin tener en cuenta que su
+ETIQUETA podía depender de un cierre posterior al corte:
+
+- Horizonte 5: una fila de train fechada `cutoff - 5 sesiones` tiene
+  como target el cierre de exactamente `cutoff` (la primera sesión de
+  test) — ya es información de test.
+- Horizonte 20: hasta 20 sesiones de solape, el problema más grave de
+  los tres.
+- Horizonte 1 (el modelo de producción actual): el mismo problema en
+  miniatura, 1 sola sesión de solape — efecto práctico mínimo
+  (~208 filas de ~510k) pero técnicamente el mismo bug.
+
+El modelo nunca llegaba a VER filas de test (eso ya estaba bien
+protegido, ver sección 8 de `docs/entregas/04_analisis_modelado.md`),
+pero sí aprendía de ETIQUETAS construidas con el movimiento de precio
+real del periodo que se suponía no había visto todavía — con
+autocorrelación de mercado (tendencias que continúan unos días), esto
+podía inflar la accuracy de test de forma artificial, sobre todo en
+horizonte 20.
+
+**Fix** (`src/model.py`): `temporal_split()` y `_time_series_folds()`
+ganan un parámetro `purge_sessions` — purgan del train las
+`purge_sessions` sesiones de mercado (no días naturales: se usa el
+calendario de fechas real presente en `gold_train`, ordenado, para no
+purgar de más/de menos por culpa de fines de semana) inmediatamente
+anteriores al corte de cada frontera train/test o train/validación.
+`train_and_evaluate()` y `tune_lightgbm()` llaman siempre con
+`purge_sessions=horizon` — se aplica también a horizonte 1, por
+consistencia, aunque ahí el efecto sea mínimo. El test NO se purga, solo
+el train; su definición (`date >= cutoff`) no cambia.
+
+**Retraining**: los tres modelos (día/semana/mes) se reentrenaron con el
+fix — ver "Reentrenamiento de los tres horizontes tras el fix de
+leakage" más abajo para las cifras antes/después.
+
+### 2. Calibración de predicted_probability
+
+El segundo punto tenía dos partes: (a) comprobar de verdad si
+`predicted_probability` está calibrada, en vez de asumirlo, y (b) no
+presentarla como "confianza" sin haberlo hecho.
+
+**Comprobación añadida** (`calibration_diagnostic()` en `src/model.py`,
+reutilizada tanto al entrenar — se imprime en el reporte de CLI y se
+guarda en el propio `.joblib` como referencia — como en vivo desde el
+dashboard vía `data_access.get_calibration_diagnostic()`, que recalcula
+sobre el test oficial ACTUAL en vez de un valor congelado del momento
+del entrenamiento, mismo patrón que `get_confidence_accuracy`/
+`get_accuracy_by_volatility`, que ya existían): se calcula el Brier
+score clásico (`predicted_probability` de "sube" vs. el resultado real)
+y una tabla/curva de fiabilidad que agrupa las predicciones del test en
+10 cubos por CONFIANZA declarada (`max(p, 1-p)`, la confianza en la
+dirección predicha — no `p` en crudo, que es lo que de verdad se le
+enseña al usuario) y compara, en cada cubo, la confianza media declarada
+contra el acierto real observado.
+
+**Dónde se ve**: se reincorpora "¿Funciona de verdad?"
+(`views/rendimiento_del_modelo.py`, se había quitado de la navegación el
+2026-09-08 por un motivo totalmente distinto — ver la sección de arriba
+"Quitar '¿Funciona de verdad?'..." — y vuelve ahora por este) con una
+sección nueva "¿Es fiable la probabilidad que muestra el modelo?":
+Brier score + gráfico de fiabilidad (confianza declarada en el eje X,
+acierto real en el eje Y, con la diagonal de calibración perfecta como
+referencia). La página gana además un selector de horizonte (antes solo
+cargaba el horizonte día) para poder comprobar los tres modelos, no solo
+el diario — relevante porque el leakage corregido en el punto 1 afectaba
+más a los horizontes largos.
+
+**Aviso añadido junto a la propia probabilidad**: en vez de solo
+documentar la calibración en una pestaña aparte, "Predicciones" y
+"Dashboard" (los dos sitios donde se muestra `predicted_probability` en
+vivo) ganan un `help=` junto a la métrica explicando que es la salida
+cruda de Random Forest, sin calibración garantizada, y remitiendo a
+"¿Funciona de verdad?" para la comprobación real — la etiqueta se deja
+como "Probabilidad estimada" (neutral, técnicamente exacta) en vez de
+renombrarla a "Confianza", precisamente para no volver a vender algo que
+no se ha demostrado.
+
+**Hallazgo aparte, no pedido por el tutor pero encontrado al revisar
+esto**: `predict.py` guarda en `predicted_probability` SIEMPRE `P(sube)`
+(`model.predict_proba(x)[:, 1]`), nunca ajustado a la dirección predicha.
+Cuando `predicted_target_up_down=0` ("Baja"), el dashboard mostraba ese
+mismo número sin invertir — p. ej. "35%" junto a "📉 Baja", que un
+usuario lee de forma natural como "35% de probabilidad de bajar", cuando
+en realidad significa 65% de confianza en "baja" (100% - 35%). Es un bug
+de visualización real y potencialmente más grave que la falta de
+calibración (un número mal etiquetado, no solo impreciso). Ya existía
+código que SÍ trataba esto bien
+(`data_access.get_confidence_accuracy`, con
+`confianza = np.maximum(proba_up, 1 - proba_up)`, usado en la página
+"Resumen" no registrada) — el bug estaba solo en el camino de
+`predictions.predicted_probability` mostrado en vivo en Dashboard y
+Predicciones. **Fix**: en ambas páginas, se calcula
+`confianza = predicted_probability if predicted_target_up_down == 1 else 1 - predicted_probability`
+antes de mostrarla — no se ha tocado el esquema de `predictions` (sigue
+guardando `P(sube)` en crudo, es un dato válido y usado en otros sitios
+como `avg_probability` de "Resumen"), el fix es solo en la capa de
+presentación.
+
+### Reentrenamiento de los tres horizontes tras el fix de leakage
+
+Pendiente de ejecutar y documentar aquí con cifras reales — bloqueado en
+el momento de escribir esto por un fallo de infraestructura del sandbox
+de este agente (el propio contenedor de shell no arrancaba, error de
+montaje ajeno al proyecto). En cuanto se pueda ejecutar
+`python src/gold.py` (si hace falta) + `python src/model.py --horizon
+1/5/20` + `python src/predict.py --horizon 1/5/20`, se documenta aquí la
+comparación de accuracy/Brier score antes vs. después del fix, honesta
+en cualquier sentido (si el fix baja la accuracy de test porque
+eliminaba una fuga que la inflaba artificialmente, ES el resultado
+correcto a reportar, no algo a esconder — mismo criterio de
+"Honestidad de resultado" de siempre).

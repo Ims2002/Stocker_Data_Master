@@ -4,6 +4,17 @@ obligatorios, sobre el ÚNICO test temporal real (nunca visto en
 entrenamiento). Ver CONTEXTO.md, "Contrato de evaluación" y "Honestidad de
 resultado": si el modelo no supera a los baselines, se muestra igual. Vive
 en views/, no pages/ — ver nota en views/inicio.py sobre por qué.
+
+REINCORPORADA A LA NAVEGACIÓN 2026-09-09 (se había quitado el
+2026-09-08, ver CONTEXTO.md "Quitar '¿Funciona de verdad?' y profundizar
+en noticias desde el Dashboard"). Vuelve por un motivo distinto al que la
+quitó: feedback de un tutor sobre `predicted_probability` ("no la
+vendería como confianza sin comprobar calibración", ver CONTEXTO.md
+"Calibración de predicted_probability") — esta página es el sitio
+natural para esa comprobación, junto a las métricas de acierto que ya
+mostraba. Se añade además un selector de horizonte (día/semana/mes, no
+existía antes — la página solo cargaba el horizonte por defecto) para
+poder comprobar la calibración de los tres modelos, no solo el diario.
 """
 
 from __future__ import annotations
@@ -18,6 +29,11 @@ import streamlit as st
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import data_access as da  # noqa: E402
 
+engine = da.get_engine()
+
+HORIZON_LABELS = {1: "Día (mañana)", 5: "Semana (~5 sesiones)", 20: "Mes (~20 sesiones)"}
+_LABEL_TO_HORIZON = {v: k for k, v in HORIZON_LABELS.items()}
+
 st.title("¿Funciona de verdad el modelo?")
 st.markdown(
     "Para saberlo, se prueba el modelo contra datos que **nunca ha visto** — como un examen con "
@@ -25,16 +41,25 @@ st.markdown(
     "Si no les gana, el modelo no está aportando nada real."
 )
 
+horizonte_label = st.segmented_control(
+    "Horizonte", list(HORIZON_LABELS.values()), default=HORIZON_LABELS[1], key="rendimiento_horizonte",
+)
+horizon = _LABEL_TO_HORIZON[horizonte_label] if horizonte_label else 1
+
 
 @st.cache_resource
-def _model_bundle():
-    return da.load_latest_model()
+def _model_bundle(horizon: int):
+    return da.load_latest_model(horizon=horizon)
 
 
 try:
-    bundle = _model_bundle()
-except FileNotFoundError as exc:
-    st.error(f"No hay ningún modelo entrenado todavía: {exc}. Ejecuta antes `python src/model.py`.")
+    bundle = _model_bundle(horizon)
+except FileNotFoundError:
+    st.info(
+        f"Todavía no hay ningún modelo entrenado para el horizonte **{horizonte_label}** — ejecuta "
+        f"`python src/model.py --horizon {horizon}`. Elige **Día (mañana)** mientras tanto.",
+        icon="🚧",
+    )
     st.stop()
 
 if "metrics_model" not in bundle:
@@ -124,3 +149,73 @@ st.markdown(
 Ver `CONTEXTO.md`, sección "Contrato de evaluación", para el porqué de este diseño.
     """
 )
+
+st.divider()
+
+st.subheader("¿Es fiable la probabilidad que muestra el modelo?")
+st.markdown(
+    """
+El modelo no solo dice "sube" o "baja": en "Predicciones" y "Dashboard" también enseña una probabilidad
+para esa dirección. Para que esa probabilidad se pueda leer como una confianza real, tiene que estar
+**calibrada**: si el modelo dice "70% de confianza" en un grupo de predicciones, ese grupo debería acertar
+aproximadamente el 70% de las veces — ni más ni menos. Random Forest no lo garantiza por diseño, así que
+se comprueba con datos reales del test oficial en vez de asumirlo (feedback recibido de un tutor del TFM,
+ver CONTEXTO.md "Calibración de predicted_probability").
+    """
+)
+
+
+@st.cache_data(ttl=300)
+def _calibration(_model_version: str):
+    # _model_version solo participa en la clave de caché (mismo patrón
+    # que _confidence_accuracy en views/inicio.py) — la función usa el
+    # bundle vía closure.
+    return da.get_calibration_diagnostic(engine, bundle)
+
+
+calib = _calibration(bundle.get("_model_version", ""))
+if calib is None:
+    st.caption("Sin datos suficientes en el test real todavía para calcular la calibración.")
+else:
+    col_a, col_b = st.columns([1, 2])
+    with col_a:
+        st.metric(
+            "Brier score", f"{calib['brier_score']:.3f}",
+            help="0 = perfecto. 0.25 = tan informativo como predecir siempre 50%. Cuanto más bajo, mejor.",
+        )
+        st.caption(
+            f"Calculado sobre las {sum(b['n'] for b in calib['reliability_table']):,} predicciones "
+            "resueltas del test oficial, en vivo (no un valor congelado del momento del entrenamiento)."
+        )
+    with col_b:
+        tabla = calib["reliability_table"]
+        if not tabla:
+            st.caption("No hay suficientes cubos distintos de confianza para dibujar la curva.")
+        else:
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(
+                x=[0.5, 1.0], y=[0.5, 1.0], mode="lines", name="Calibración perfecta",
+                line=dict(color="#9CA3AF", dash="dot"),
+            ))
+            fig.add_trace(go.Scatter(
+                x=[b["confianza_media"] for b in tabla], y=[b["acierto_real"] for b in tabla],
+                mode="lines+markers", name="Modelo (real)",
+                line=dict(color="#1D4ED8", width=2), marker=dict(size=7),
+                text=[f"n={b['n']}" for b in tabla], hovertemplate="confianza %{x:.0%} · acierto %{y:.0%} · %{text}<extra></extra>",
+            ))
+            fig.update_layout(
+                height=320, margin=dict(l=10, r=10, t=20, b=10),
+                xaxis_title="Confianza declarada", yaxis_title="Acierto real observado",
+                xaxis=dict(range=[0.45, 1.02], tickformat=".0%"), yaxis=dict(range=[0.0, 1.02], tickformat=".0%"),
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+                plot_bgcolor="#FFFFFF", paper_bgcolor="#FFFFFF",
+            )
+            with st.container(border=True):
+                st.plotly_chart(fig, width="stretch")
+    st.caption(
+        "Cada punto agrupa un décimo de las predicciones del test por confianza declarada. Cuanto más se "
+        "acerque la línea azul a la diagonal gris, más calibrada está la probabilidad. Por debajo de la "
+        "diagonal: el modelo dice tener más confianza de la que realmente demuestra — es el caso a "
+        "vigilar antes de presentar esta probabilidad como \"confianza\" sin más. Por encima: el modelo es "
+        "más certero de lo que dice (infravalora su propia confianza, menos grave para el usuario)."
+    )

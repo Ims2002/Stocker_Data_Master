@@ -71,7 +71,9 @@ def export_demo_db(tickers: list[str], out_path: Path) -> None:
     # encontrado al verificar la primera versión de este script con
     # AppTest: "OperationalError: no such table: news_sentiment_daily".
     dst_engine = create_engine(f"sqlite:///{out_path}")
-    dbmod.init_db(dst_engine)
+    # wal=False: la demo se versiona en git como un único fichero .db; en
+    # modo WAL parte de los datos podría quedarse en un fichero -wal aparte.
+    dbmod.init_db(dst_engine, wal=False)
 
     print(f"[export_demo_db] universo: {len(tickers)} tickers", file=sys.stderr)
 

@@ -195,6 +195,13 @@ predictions = Table(
     # Se rellena a posteriori, cuando el cierre real de date_predicha ya
     # existe en daily_prices — por eso es nullable y no lleva FK propia.
     Column("actual_target_up_down", Integer, nullable=True),
+    # Sesión de origen de la predicción (la fecha de gold_inference con la
+    # que se predijo). Añadida en la revisión de auditoría (M5): antes
+    # track_predictions.py deducía el origen "N filas antes" en
+    # daily_prices, y un hueco de un día desplazaba la comparación. Nullable
+    # porque las predicciones anteriores a este cambio no la tienen (se
+    # siguen resolviendo con el método posicional).
+    Column("date_origen", Date, nullable=True),
     ForeignKeyConstraint(["ticker"], ["stocks.ticker"]),
     CheckConstraint("predicted_target_up_down IN (0, 1)", name="ck_predictions_predicted_binary"),
     CheckConstraint(
@@ -265,6 +272,32 @@ news_backfill_progress = Table(
 )
 
 
+# --- news_fetch_log — hasta qué fecha se han pedido noticias de cada ticker
+# (revisión de auditoría, A3). La actualización diaria pedía solo
+# "ayer -> hoy" a 25 tickers al día: los días de un ticker no consultado se
+# perdían para siempre (la cobertura cayó de ~200 tickers/día a ~20). Con
+# esta tabla, cada ticker se pide desde su última fecha consultada hasta
+# hoy, así que un día sin consultar no se pierde, solo se recupera más tarde.
+news_fetch_log = Table(
+    "news_fetch_log",
+    metadata,
+    Column("ticker", String, primary_key=True),
+    Column("last_time_to", Date, nullable=False),
+    Column("updated_at", String, nullable=False),
+    ForeignKeyConstraint(["ticker"], ["stocks.ticker"]),
+)
+
+
+def _migrate_predictions_date_origen(engine: Engine) -> None:
+    """Añade `predictions.date_origen` a bases de datos existentes (ALTER
+    TABLE ADD COLUMN, sin perder filas). Ver comentario en la tabla."""
+    with engine.begin() as conn:
+        cols = [row[1] for row in conn.execute(text("PRAGMA table_info(predictions)"))]
+        if cols and "date_origen" not in cols:
+            conn.execute(text("ALTER TABLE predictions ADD COLUMN date_origen DATE"))
+            print("[db] predictions: añadida columna date_origen", file=sys.stderr)
+
+
 def _migrate_gold_tables(engine: Engine) -> None:
     """Si `gold_train`/`gold_inference` existen con un esquema antiguo
     (sin las columnas de la ampliación de features de 2026-08-06 —
@@ -320,15 +353,22 @@ def _migrate_news_backfill_progress(engine: Engine) -> None:
             conn.execute(text("DROP TABLE news_backfill_progress"))
 
 
+# Espera máxima (ms) cuando otra conexión tiene la base de datos bloqueada,
+# en vez de fallar al instante con "database is locked" (visto en el log
+# real cuando news.py y el pipeline diario escribían a la vez).
+SQLITE_BUSY_TIMEOUT_MS = 30000
+
+
 def _enable_sqlite_foreign_keys(engine: Engine) -> None:
     """SQLite ignora las FOREIGN KEY constraints salvo que se activen por
     conexión — sin esto, las ForeignKeyConstraint definidas arriba no se
-    harían cumplir en tiempo de ejecución."""
+    harían cumplir en tiempo de ejecución. También fija `busy_timeout`."""
 
     @event.listens_for(engine, "connect")
     def _set_sqlite_pragma(dbapi_connection, connection_record):  # noqa: ANN001
         cursor = dbapi_connection.cursor()
         cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
         cursor.close()
 
 
@@ -339,7 +379,17 @@ def get_engine() -> Engine:
     return engine
 
 
-def init_db(engine: Engine | None = None) -> Engine:
+def quick_check(engine: Engine | None = None) -> list[str]:
+    """`PRAGMA quick_check`: lista vacía si la base de datos está sana; si
+    no, los mensajes de error. Los scripts de escritura lo ejecutan antes de
+    tocar nada para no seguir escribiendo sobre un fichero dañado (C1)."""
+    engine = engine or get_engine()
+    with engine.connect() as conn:
+        rows = [r[0] for r in conn.execute(text("PRAGMA quick_check"))]
+    return [] if rows == ["ok"] else rows
+
+
+def init_db(engine: Engine | None = None, wal: bool = True) -> Engine:
     """Crea todas las tablas si no existen. No destruye ni modifica tablas
     ya existentes (checkfirst=True).
 
@@ -349,9 +399,18 @@ def init_db(engine: Engine | None = None) -> Engine:
     comodidad": una vista no puede quedar nunca desincronizada de la tabla
     que agrega, porque se recalcula en cada SELECT)."""
     engine = engine or get_engine()
+    if wal and str(engine.url).startswith("sqlite"):
+        # WAL (revisión de auditoría, C1): lectores y escritor no se bloquean
+        # entre sí y una transacción interrumpida (PC suspendido, proceso
+        # matado) no deja la base de datos a medias. Es persistente en el
+        # fichero. `wal=False` para la base de datos de la demo, que se
+        # versiona en git como un único fichero.
+        with engine.connect() as conn:
+            conn.exec_driver_sql("PRAGMA journal_mode=WAL")
     _migrate_news_backfill_progress(engine)
     _migrate_gold_tables(engine)
     metadata.create_all(engine, checkfirst=True)
+    _migrate_predictions_date_origen(engine)
     with engine.begin() as conn:
         conn.execute(
             text(

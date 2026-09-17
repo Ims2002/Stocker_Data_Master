@@ -36,6 +36,17 @@ Este módulo NO integra la señal como feature del modelo — eso es un paso
 posterior y deliberadamente separado (ver CONTEXTO.md): aquí solo se puebla
 la base de datos.
 
+Revisión de auditoría (16/09/2026):
+- A3: la actualización diaria pedía solo "ayer -> hoy" a 25 tickers al día y
+  los días de los tickers no consultados se perdían (la cobertura cayó de
+  ~200 tickers/día a ~20). Ahora cada ticker se pide desde su última fecha
+  consultada (tabla `news_fetch_log`) hasta hoy, empezando por los que más
+  tiempo llevan sin consultarse.
+- A5: los mensajes de error de Alpha Vantage incluyen la clave de la API; se
+  enmascaran antes de escribirlos en el log.
+- C1: usa el mismo cerrojo que el pipeline diario para no escribir en la
+  base de datos a la vez.
+
 Uso:
     python news.py                    # modo automático: backfill si queda pendiente, si no, diario
                                        # (este es el que debe usar la tarea programada)
@@ -50,6 +61,7 @@ import argparse
 import datetime as dt
 import hashlib
 import json
+import re
 import sys
 import time
 from pathlib import Path
@@ -66,6 +78,7 @@ from config import (  # noqa: E402
     NEWS_BACKFILL_REFERENCE_DATE,
     NEWS_BACKFILL_WINDOW_DAYS,
     NEWS_DAILY_CALL_BUDGET,
+    NEWS_DAILY_MAX_WINDOW_DAYS,
     NEWS_PRIORITY_DAILY_SHARE,
     NEWS_PRIORITY_TICKERS,
     NEWS_RAW_DIR,
@@ -99,6 +112,17 @@ def _to_av_symbol(ticker: str) -> str:
 
 def _from_av_symbol(symbol: str) -> str:
     return _REVERSE_TICKER_OVERRIDES.get(symbol, symbol)
+
+
+_API_KEY_IN_MESSAGE_RE = re.compile(r"(API key as )\S+", re.IGNORECASE)
+
+
+def mask_secrets(message: str) -> str:
+    """Oculta la clave de Alpha Vantage en cualquier texto que vaya al log."""
+    message = _API_KEY_IN_MESSAGE_RE.sub(r"\1****", str(message))
+    if ALPHA_VANTAGE_API_KEY:
+        message = message.replace(ALPHA_VANTAGE_API_KEY, "****")
+    return message
 
 
 class AlphaVantageQuotaError(RuntimeError):
@@ -197,12 +221,12 @@ def fetch_news_batch(tickers: list[str], time_from: dt.date, time_to: dt.date) -
     data = resp.json()
 
     if "Note" in data or "Information" in data:
-        message = str(data.get("Note") or data.get("Information") or data)
+        message = mask_secrets(str(data.get("Note") or data.get("Information") or data))
         if _looks_like_quota_error(message):
             raise AlphaVantageQuotaError(message)
         raise AlphaVantageRequestError(message)
     if "feed" not in data:
-        raise AlphaVantageRequestError(f"respuesta inesperada de Alpha Vantage: {data}")
+        raise AlphaVantageRequestError(mask_secrets(f"respuesta inesperada de Alpha Vantage: {data}"))
     return data
 
 
@@ -361,7 +385,7 @@ def run_backfill(engine: Engine, max_calls: int) -> None:
         except AlphaVantageQuotaError as exc:
             # Cupo agotado: no tiene sentido seguir gastando llamadas hoy,
             # se para TODA la ejecución (no solo este ítem).
-            print(f"[news] cupo de Alpha Vantage agotado — parando esta ejecución ({exc})", file=sys.stderr)
+            print(f"[news] cupo de Alpha Vantage agotado — parando esta ejecución ({mask_secrets(exc)})", file=sys.stderr)
             calls_made += 1
             break
         except Exception as exc:  # noqa: BLE001
@@ -372,7 +396,7 @@ def run_backfill(engine: Engine, max_calls: int) -> None:
             # bloquear el progreso del resto del backfill.
             print(
                 f"[news] lote {batch_id} ({window_start}→{window_end}): FALLÓ, se reintentará en la "
-                f"próxima ejecución ({exc})",
+                f"próxima ejecución ({mask_secrets(exc)})",
                 file=sys.stderr,
             )
             failed_batches.add(batch_id)
@@ -394,80 +418,115 @@ def run_backfill(engine: Engine, max_calls: int) -> None:
         )
 
 
-def run_daily_update(engine: Engine, max_calls: int = NEWS_DAILY_CALL_BUDGET) -> None:
-    """Actualización incremental: solo ayer→hoy.
+def _last_fetch_dates(engine: Engine) -> dict[str, dt.date]:
+    """Última fecha consultada por ticker: `news_fetch_log` si existe; si
+    no, la fecha del artículo más reciente guardado (para arrancar la tabla
+    sobre una base de datos que ya tenía noticias)."""
+    from sqlalchemy import func, select
 
-    CORREGIDO 2026-08-06: con NEWS_TICKERS_PER_CALL=1 hay 208 lotes (uno
-    por ticker), no ~21 como cuando se agrupaban 10 tickers por llamada —
-    procesarlos todos en una ejecución superaría 8 veces el presupuesto
-    diario (NEWS_DAILY_CALL_BUDGET=25). Esta función tope a `max_calls`
-    por ejecución.
+    with engine.begin() as conn:
+        logged = {
+            r.ticker: r.last_time_to
+            for r in conn.execute(select(dbmod.news_fetch_log.c.ticker, dbmod.news_fetch_log.c.last_time_to))
+        }
+        from_articles = {
+            r[0]: r[1]
+            for r in conn.execute(
+                select(dbmod.news_articles.c.ticker, func.max(dbmod.news_articles.c.date))
+                .group_by(dbmod.news_articles.c.ticker)
+            )
+        }
+    out = {}
+    for ticker in TICKERS:
+        d = logged.get(ticker) or from_articles.get(ticker)
+        if isinstance(d, str):
+            d = dt.date.fromisoformat(d[:10])
+        if d is not None:
+            out[ticker] = d
+    return out
 
-    AMPLIADO 2026-08-25 (ver CONTEXTO.md, "Prioridad de noticias para
-    tickers relevantes" y config.py, NEWS_PRIORITY_TICKERS): dentro de ese
-    presupuesto, NEWS_PRIORITY_DAILY_SHARE se reserva para
-    NEWS_PRIORITY_TICKERS y se recorre en RONDA determinista (no
-    aleatoria) — el offset de cada día se deriva de
-    `date.today().toordinal()` (un entero que ya avanza uno por día de
-    calendario), así que no hace falta persistir ningún cursor: cada
-    prioritario se revisita exactamente cada
-    ceil(len(NEWS_PRIORITY_TICKERS) / llamadas_prioridad) días, sin saltos
-    ni repeticiones antes de completar la vuelta. El resto del
-    presupuesto sigue el muestreo ALEATORIO de siempre, pero restringido
-    a los tickers NO prioritarios (para no gastar dos veces el mismo día
-    en un ticker que ya le tocaba por ronda).
 
-    Trade-off real y aceptado (ver comentario en config.py junto a
-    NEWS_PRIORITY_DAILY_SHARE): el presupuesto total no cambia, solo se
-    reparte de forma desigual — los NO prioritarios pasan de refrescarse
-    cada ~8-9 días de media a cada ~30 días, a cambio de que los
-    prioritarios pasen a refrescarse cada pocos días. Asume
-    NEWS_TICKERS_PER_CALL == 1 (cada lote es un único ticker, ver
-    ticker_batches()) para poder etiquetar un lote entero como
-    prioritario/no prioritario sin ambigüedad."""
-    import random
+def _mark_fetched(engine: Engine, ticker: str, time_to: dt.date) -> None:
+    stmt = sqlite_insert(dbmod.news_fetch_log).values(
+        ticker=ticker, last_time_to=time_to, updated_at=dt.datetime.now().isoformat(timespec="seconds"),
+    )
+    stmt = stmt.on_conflict_do_update(
+        index_elements=["ticker"],
+        set_={"last_time_to": stmt.excluded.last_time_to, "updated_at": stmt.excluded.updated_at},
+    )
+    with engine.begin() as conn:
+        conn.execute(stmt)
 
-    batches = ticker_batches()
+
+def plan_daily_update(
+    last_fetch: dict[str, dt.date], today: dt.date, max_calls: int
+) -> list[tuple[str, dt.date, dt.date, bool]]:
+    """Qué tickers consultar hoy y con qué ventana.
+
+    - Reparto del presupuesto igual que antes: NEWS_PRIORITY_DAILY_SHARE
+      para NEWS_PRIORITY_TICKERS y el resto para los demás.
+    - Dentro de cada grupo, primero los que llevan más tiempo sin
+      consultarse (los nunca consultados, antes que nadie). Así nadie se
+      queda atrás indefinidamente y no hace falta azar.
+    - Ventana: desde la última fecha consultada (se repite ese día por si
+      llegaron artículos más tarde; el upsert evita duplicados) hasta
+      mañana, limitada a NEWS_DAILY_MAX_WINDOW_DAYS.
+
+    Devuelve (ticker, time_from, time_to, es_prioritario)."""
     priority_set = set(NEWS_PRIORITY_TICKERS)
-    priority_ids = [i for i, b in enumerate(batches) if b[0] in priority_set]
-    other_ids = [i for i, b in enumerate(batches) if b[0] not in priority_set]
+    never = dt.date.min
 
-    priority_calls = 0
-    if priority_ids:
-        priority_calls = min(len(priority_ids), max(1, round(max_calls * NEWS_PRIORITY_DAILY_SHARE)))
-    other_calls = max(0, max_calls - priority_calls)
+    def order(tickers):
+        return sorted(tickers, key=lambda t: (last_fetch.get(t, never), TICKERS.index(t)))
 
-    priority_batch_ids: list[int] = []
-    if priority_ids and priority_calls:
-        offset = (dt.date.today().toordinal() * priority_calls) % len(priority_ids)
-        priority_batch_ids = [priority_ids[(offset + k) % len(priority_ids)] for k in range(priority_calls)]
+    priority = order([t for t in TICKERS if t in priority_set])
+    others = order([t for t in TICKERS if t not in priority_set])
+    n_priority = min(len(priority), max(1, round(max_calls * NEWS_PRIORITY_DAILY_SHARE))) if priority else 0
+    n_others = min(len(others), max(0, max_calls - n_priority))
+    # Si un grupo no agota su parte, el sobrante pasa al otro.
+    n_priority = min(len(priority), max_calls - n_others)
 
-    other_sample_size = min(other_calls, len(other_ids))
-    other_batch_ids = random.sample(other_ids, other_sample_size) if other_sample_size > 0 else []
+    time_to = today + dt.timedelta(days=1)
+    earliest = today - dt.timedelta(days=NEWS_DAILY_MAX_WINDOW_DAYS)
+    plan = []
+    for group, n, is_priority in ((priority, n_priority, True), (others, n_others, False)):
+        for ticker in group[:n]:
+            start = last_fetch.get(ticker, earliest)
+            start = max(start, earliest)
+            plan.append((ticker, start, time_to, is_priority))
+    return plan
 
-    selected = [(bid, batches[bid]) for bid in priority_batch_ids + other_batch_ids]
-    priority_ids_selected = set(priority_batch_ids)
 
-    yesterday = dt.date.today() - dt.timedelta(days=1)
+def run_daily_update(engine: Engine, max_calls: int = NEWS_DAILY_CALL_BUDGET) -> None:
+    """Actualización incremental por ticker desde su última consulta (ver
+    `plan_daily_update`). Para en cuanto Alpha Vantage indica que el cupo
+    diario está agotado, sin gastar más llamadas en errores."""
     today = dt.date.today()
+    plan = plan_daily_update(_last_fetch_dates(engine), today, max_calls)
 
-    calls_made = 0
-    for batch_id, tickers_in_batch in selected:
-        etiqueta = "prioritario" if batch_id in priority_ids_selected else "aleatorio"
+    calls_made = ok = 0
+    for ticker, time_from, time_to, is_priority in plan:
+        etiqueta = "prioritario" if is_priority else "resto"
         try:
-            data = fetch_news_batch(tickers_in_batch, yesterday, today)
-            save_raw_json(data, batch_id, yesterday)
-            n = upsert_articles(data, set(tickers_in_batch), engine)
-            print(f"[news] lote {batch_id} ({etiqueta}): {n} filas de sentimiento (actualización diaria)", file=sys.stderr)
+            data = fetch_news_batch([ticker], time_from, time_to)
+            batch_id = TICKERS.index(ticker)
+            save_raw_json(data, batch_id, time_from)
+            n = upsert_articles(data, {ticker}, engine)
+            _mark_fetched(engine, ticker, today)
+            ok += 1
+            print(f"[news] {ticker} ({etiqueta}, {time_from}→{today}): {n} filas de sentimiento", file=sys.stderr)
+        except AlphaVantageQuotaError as exc:
+            calls_made += 1
+            print(f"[news] cupo de Alpha Vantage agotado — parando ({mask_secrets(exc)})", file=sys.stderr)
+            break
         except Exception as exc:  # noqa: BLE001
-            print(f"[news] lote {batch_id} ({etiqueta}): FALLÓ la actualización diaria ({exc})", file=sys.stderr)
+            print(f"[news] {ticker} ({etiqueta}): FALLÓ la actualización ({mask_secrets(exc)})", file=sys.stderr)
         calls_made += 1
         time.sleep(NEWS_REQUEST_DELAY_SECONDS)
 
     print(
-        f"[news] actualización diaria: {calls_made} llamada(s) hecha(s) de {len(batches)} tickers totales "
-        f"({len(priority_batch_ids)} prioritarios en ronda determinista + {len(other_batch_ids)} aleatorios "
-        "del resto, ver docstring de run_daily_update).",
+        f"[news] actualización diaria: {ok}/{calls_made} llamada(s) correctas de {len(plan)} planificadas "
+        f"(universo de {len(TICKERS)} tickers).",
         file=sys.stderr,
     )
 
@@ -492,6 +551,7 @@ def main(argv: list[str] | None = None) -> int:
     mode = parser.add_mutually_exclusive_group(required=False)
     mode.add_argument("--backfill", action="store_true", help="fuerza el backfill histórico")
     mode.add_argument("--daily", action="store_true", help="fuerza la actualización incremental (ayer→hoy)")
+    parser.add_argument("--no-lock", action="store_true", help=argparse.SUPPRESS)  # lo usa run_pipeline.py, que ya tiene el cerrojo
     parser.add_argument(
         "--max-calls",
         type=int,
@@ -500,20 +560,28 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    engine = dbmod.get_engine()
-    dbmod.init_db(engine)
-    dbmod.seed_stocks(engine, tickers=TICKERS)
+    def _run() -> int:
+        engine = dbmod.get_engine()
+        dbmod.init_db(engine)
+        dbmod.seed_stocks(engine, tickers=TICKERS)
 
-    if args.backfill:
-        run_backfill(engine, max_calls=args.max_calls)
-    elif args.daily:
-        run_daily_update(engine, max_calls=args.max_calls)
-    else:
-        # Sin flag: modo automático — es el que debe usar la tarea
-        # programada (ver run_news_daily.bat).
-        run_auto(engine, max_calls=args.max_calls)
-    return 0
+        if args.backfill:
+            run_backfill(engine, max_calls=args.max_calls)
+        elif args.daily:
+            run_daily_update(engine, max_calls=args.max_calls)
+        else:
+            # Sin flag: modo automático — es el que debe usar la tarea
+            # programada (ver run_news_daily.bat).
+            run_auto(engine, max_calls=args.max_calls)
+        return 0
+
+    if args.no_lock:
+        return _run()
+    from pipeline_lock import pipeline_lock
+
+    with pipeline_lock("news"):
+        return _run()
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(main(sys.argv[1:]))

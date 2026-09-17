@@ -37,6 +37,7 @@ import streamlit as st
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import data_access as da  # noqa: E402
+import ui  # noqa: E402
 import premium_chat  # noqa: E402
 
 engine = da.get_engine()
@@ -116,10 +117,10 @@ def _render_chat(ticker: str, nombre: str) -> None:
             st.markdown(
                 f"""
                 <div style="text-align:center; padding:64px 20px;">
-                    <div style="font-size:1.05rem; color:#0B0F19; font-weight:600;">
+                    <div style="font-size:1.05rem; font-weight:600;">
                         Pregúntame lo que quieras sobre los resultados de {html.escape(ticker)}
                     </div>
-                    <div style="font-size:0.85rem; color:#9CA3AF; margin-top:6px; max-width:380px;
+                    <div style="font-size:0.85rem; opacity:0.6; margin-top:6px; max-width:380px;
                                 margin-left:auto; margin-right:auto;">
                         Respondo solo con el comunicado de resultados, la earnings call y el
                         análisis de esta pestaña.
@@ -164,7 +165,15 @@ def _render_chat(ticker: str, nombre: str) -> None:
                     try:
                         respuesta = premium_chat.ask(ticker, nombre, corpus, history)
                     except Exception as exc:  # noqa: BLE001 — cualquier fallo de la API se muestra, no rompe la página
-                        respuesta = f"No se ha podido obtener respuesta ahora mismo ({exc}). Inténtalo de nuevo en un momento."
+                        # El error NO entra en el historial (auditoría, A5): antes se
+                        # guardaba como si fuera una respuesta del asistente y se
+                        # reenviaba a la API en las preguntas siguientes.
+                        history.pop()
+                        st.error(
+                            f"No se ha podido obtener respuesta ahora mismo ({type(exc).__name__}). "
+                            "Inténtalo de nuevo en un momento."
+                        )
+                        return
                 st.markdown(respuesta)
         history.append({"role": "assistant", "content": respuesta})
         st.rerun()
@@ -210,7 +219,7 @@ for ticker, tab in zip(HYPERSCALERS, tabs):
             st.markdown(contenido)
             _render_chat(ticker, nombre_plano)
             continue
-        with st.container(border=True):
+        with ui.card(f"premium_pendiente_{ticker}"):
             st.markdown(
                 f'<div>{logo_html}<span style="font-size:1.05rem; vertical-align:middle;">'
                 f'{nombre} · <strong>#{ticker}</strong></span></div>',
@@ -224,7 +233,7 @@ cols = st.columns(len(PROXIMAMENTE))
 for item, col in zip(PROXIMAMENTE, cols):
     with col:
         contenido = _read_analysis(str(_PREMIUM_DIR / "otros" / f"{item['ticker']}.md"))
-        with st.container(border=True):
+        with ui.card(f"premium_proximamente_{item['ticker']}"):
             st.markdown(f"**{html.escape(item['nombre'])}** · `{item['ticker']}`")
             if contenido:
                 st.markdown(contenido)

@@ -1,22 +1,61 @@
-# Tema visual del dashboard — minimalista, base blanca con acentos azul/negro
-# (mockup aprobado por el usuario 2026-08-06, ver CONTEXTO.md). No tocar los
-# colores sin actualizar también dashboard/ui.py (CSS) y CONTEXTO.md.
+# Tema visual del dashboard (rediseño 2026-09-17, sustituye al minimalista
+# blanco/azul del 2026-08-06):
+#
+#   - Modo claro  = "Fintech limpia": fondo gris muy claro, tarjetas blancas
+#     redondeadas, tipografía Figtree, acento verde azulado.
+#   - Modo oscuro = "Terminal financiera": negro azulado, paneles planos con
+#     filetes, tipografía JetBrains Mono, acento ámbar, velas japonesas.
+#
+# Streamlit elige el modo según el sistema del visitante; cada persona puede
+# cambiarlo en el menú ⋮ > Settings > Theme. Los colores de los gráficos y
+# del HTML propio salen de dashboard/ui.py (PALETTES), que debe mantenerse
+# en sincronía con los valores de aquí.
+#
+# Requiere Streamlit 1.50 o posterior (secciones [theme.light]/[theme.dark],
+# fuentes de Google Fonts por URL, baseRadius y chartCategoricalColors).
 
 [theme]
+showWidgetBorder = true
+
+[theme.light]
 base = "light"
-primaryColor = "#1D4ED8"
-backgroundColor = "#FFFFFF"
-secondaryBackgroundColor = "#F8F9FA"
-textColor = "#0B0F19"
-font = "sans serif"
+primaryColor = "#0E8A7E"
+backgroundColor = "#F3F4F8"
+secondaryBackgroundColor = "#FFFFFF"
+textColor = "#0E1116"
+borderColor = "#E6E8EE"
+linkColor = "#0E8A7E"
+greenColor = "#0E9F6E"
+redColor = "#E5484D"
+font = "Figtree:https://fonts.googleapis.com/css2?family=Figtree:wght@400;500;600;700;800&display=swap, sans-serif"
+headingFont = "Figtree:https://fonts.googleapis.com/css2?family=Figtree:wght@400;500;600;700;800&display=swap, sans-serif"
+codeFont = "'Geist Mono':https://fonts.googleapis.com/css2?family=Geist+Mono:wght@400;500&display=swap, monospace"
+baseRadius = "0.9rem"
+chartCategoricalColors = ["#0E8A7E", "#0E1116", "#E5484D", "#F59E0B", "#6B7280", "#7DD3C0"]
+
+[theme.dark]
+base = "dark"
+primaryColor = "#F2A93B"
+backgroundColor = "#07090D"
+secondaryBackgroundColor = "#0E1219"
+textColor = "#D7DEE8"
+borderColor = "#1C2330"
+linkColor = "#57C7FF"
+greenColor = "#2BD98A"
+redColor = "#FF5470"
+font = "'JetBrains Mono':https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&display=swap, monospace"
+headingFont = "'IBM Plex Sans Condensed':https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+Condensed:wght@500;600&display=swap, sans-serif"
+codeFont = "'JetBrains Mono':https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&display=swap, monospace"
+baseRadius = "0.15rem"
+chartCategoricalColors = ["#F2A93B", "#57C7FF", "#FF5470", "#2BD98A", "#6E7A8C", "#D7DEE8"]
 
 [client]
-# Oculta el menú hamburguesa y el botón "Deploy" — no aportan nada en un
-# proyecto local y rompen la estética minimalista (ver CONTEXTO.md).
-toolbarMode = "minimal"
+# "viewer" (antes "minimal"): deja visible el menú ⋮ con Settings, que es
+# donde cada visitante elige modo claro u oscuro. Sigue ocultando las
+# opciones de desarrollador (rerun, clear cache, deploy).
+toolbarMode = "viewer"
 # La navegación real va en la barra superior (st.navigation(position="top")
-# en Inicio.py), no en la sidebar — así que no hace falta la sidebar en
-# absoluto.
+# en Inicio.py), no en la sidebar.
 showSidebarNavigation = false
 
 [browser]

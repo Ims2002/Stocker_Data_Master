@@ -8,6 +8,10 @@ mostrar un backtest vacío o incorrecto (ver "Honestidad de resultado" en
 CONTEXTO.md). set_page_config y el tema visual viven en Inicio.py
 (entrypoint del enrutador), no aquí. Vive en views/, no pages/ — ver nota
 en views/inicio.py sobre por qué.
+
+REVISIÓN DE AUDITORÍA 2026-09-16: modelo recargado al reentrenar (M4),
+aviso de fecha de datos (A4), periodo de entrenamiento atenuado en el
+gráfico (U2) y la predicción indica su propio modelo y cuándo se hizo.
 """
 
 from __future__ import annotations
@@ -16,11 +20,11 @@ import sys
 from pathlib import Path
 
 import pandas as pd
-import plotly.graph_objects as go
 import streamlit as st
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import data_access as da  # noqa: E402
+import ui  # noqa: E402
 
 engine = da.get_engine()
 
@@ -41,7 +45,8 @@ def _tickers_by_sector():
 
 
 @st.cache_resource
-def _model_bundle(horizon: int):
+def _model_bundle(horizon: int, model_version: str):
+    # model_version solo forma parte de la clave de caché (auditoría, M4).
     return da.load_latest_model(horizon=horizon)
 
 
@@ -75,6 +80,8 @@ horizon = _LABEL_TO_HORIZON[horizonte_label]
 target_col = "target_up_down" if horizon == 1 else f"target_up_down_{horizon}d"
 
 meta = da.get_ticker_metadata(engine, ticker)
+
+ui.render_data_freshness(da.get_latest_data_date(engine), da.get_pipeline_status())
 logo_url = da.ticker_logo_url(ticker, size=40)
 col_logo, col_meta = st.columns([1, 11])
 if logo_url:
@@ -86,9 +93,8 @@ with col_meta:
         f"{meta.get('pais') or 'país desconocido'}"
     )
 
-try:
-    bundle = _model_bundle(horizon)
-except FileNotFoundError:
+_version = da.latest_model_version(horizon)
+if _version is None:
     st.info(
         f"Todavía no hay ningún modelo entrenado para el horizonte **{horizonte_label}** — ejecuta "
         f"`python src/model.py --horizon {horizon}` (y `python src/predict.py --horizon {horizon}` para "
@@ -97,6 +103,7 @@ except FileNotFoundError:
         icon="🚧",
     )
     st.stop()
+bundle = _model_bundle(horizon, _version)
 
 # Trazabilidad del modelo activo para este horizonte (2026-09-10,
 # feedback de un tutor: "no queda claro... si día, semana y mes utilizan
@@ -108,7 +115,7 @@ except FileNotFoundError:
 # distinta sin ningún enlace desde aquí desde el 2026-08-30 — se deja
 # visible en el propio sitio donde se muestra la predicción, no solo
 # "encontrable" si ya sabes que esa otra pestaña existe.
-with st.container(border=True):
+with ui.card("traza_modelo"):
     st.caption(
         f"Predicción del modelo `{bundle.get('_model_version', '?')}` ({bundle.get('model_type', '?')}), "
         f"entrenado el {bundle.get('trained_at', 'fecha desconocida')[:10] if bundle.get('trained_at') else 'fecha desconocida'} "
@@ -137,16 +144,13 @@ if not gold.empty and horizon != 1:
             "se cuentan como acierto ni como fallo, simplemente no aparecen."
         )
 
-# --- Gráfico de precio con aciertos/fallos del backtest ---
-fig = go.Figure()
-fig.add_trace(
-    go.Scatter(
-        x=prices["date"], y=prices["close"], mode="lines", name="Cierre real",
-        line=dict(color="#1D4ED8", width=1.5),
-    )
-)
-
+# --- Gráfico de precio con aciertos/fallos del backtest (estilo del tema,
+# ver ui.price_chart: área en modo claro, velas en modo terminal) ---
 test_date_min = bundle.get("test_date_min")
+gold_eval = pd.DataFrame()
+gold_train_period = pd.DataFrame()
+test_cutoff = None
+caveat = None
 if not gold.empty:
     gold = gold.copy()
     gold["pred"] = da.predict_for_gold_rows(bundle, gold)
@@ -154,12 +158,9 @@ if not gold.empty:
 
     if test_date_min:
         test_cutoff = pd.Timestamp(test_date_min)
-        fig.add_vline(
-            x=test_cutoff, line_dash="dot", line_color="gray",
-            annotation_text="a partir de aquí, el modelo nunca vio estos datos", annotation_position="top",
-        )
         gold_eval = gold[gold["date"] >= test_cutoff]
-        caveat = None
+        # Periodo de entrenamiento atenuado (auditoría, U2).
+        gold_train_period = gold[gold["date"] < test_cutoff]
     else:
         gold_eval = gold
         caveat = (
@@ -168,53 +169,32 @@ if not gold.empty:
             "examen justo). Vuelve a ejecutar `python src/model.py` para arreglarlo."
         )
 
-    aciertos = gold[gold["acierto"]]
-    fallos = gold[~gold["acierto"]]
-    fig.add_trace(
-        go.Scatter(
-            x=aciertos["date"], y=aciertos["close"], mode="markers", name="Acertó",
-            marker=dict(color="#2ca02c", size=6, symbol="circle"),
-        )
-    )
-    fig.add_trace(
-        go.Scatter(
-            x=fallos["date"], y=fallos["close"], mode="markers", name="Falló",
-            marker=dict(color="#d62728", size=6, symbol="x"),
-        )
-    )
-
 # --- Predicción para el horizonte elegido (de la tabla predictions, no recalculada aquí) ---
 latest_pred = da.get_latest_prediction(engine, ticker, horizon=horizon)
-if latest_pred and latest_pred["predicted_target_up_down"] is not None:
-    direccion = "SUBE" if latest_pred["predicted_target_up_down"] == 1 else "BAJA"
-    color = "#2ca02c" if latest_pred["predicted_target_up_down"] == 1 else "#d62728"
-    last_close = prices["close"].iloc[-1]
-    fig.add_trace(
-        go.Scatter(
-            x=[pd.Timestamp(latest_pred["date_predicha"])], y=[last_close], mode="markers+text",
-            name=f"Predicción {latest_pred['date_predicha']}",
-            marker=dict(color=color, size=14, symbol="star"),
-            text=[direccion], textposition="top center",
-        )
+if latest_pred and latest_pred["model_version"] != bundle.get("_model_version"):
+    st.caption(
+        f"ℹ️ La predicción guardada se hizo con `{latest_pred['model_version']}`; el gráfico de aciertos usa "
+        f"`{bundle.get('_model_version')}`, más reciente. Se igualarán en la próxima ejecución del pipeline."
     )
 
-fig.update_layout(
-    height=500, margin=dict(l=10, r=10, t=30, b=10),
-    yaxis_title="Precio de cierre (USD)", xaxis_title=None,
-    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
-    plot_bgcolor="#FFFFFF", paper_bgcolor="#FFFFFF",
+fig = ui.price_chart(
+    prices, gold_eval=gold_eval, gold_train_period=gold_train_period,
+    test_cutoff=test_cutoff, prediction=latest_pred, height=480,
 )
-with st.container(border=True):
-    st.plotly_chart(fig, width="stretch")
+with ui.card("grafico_predicciones"):
+    ui.plotly_chart(fig)
 
 st.divider()
 
 # --- KPIs de la predicción para mañana + backtest de la ventana ---
-with st.container(border=True):
+with ui.card("kpis_predicciones"):
     col1, col2, col3 = st.columns(3)
     if latest_pred and latest_pred["predicted_target_up_down"] is not None:
-        direccion = "📈 Sube" if latest_pred["predicted_target_up_down"] == 1 else "📉 Baja"
-        col1.metric(f"Predicción para {latest_pred['date_predicha']}", direccion)
+        direccion = "▲ Sube" if latest_pred["predicted_target_up_down"] == 1 else "▼ Baja"
+        col1.metric(
+            f"Predicción para {latest_pred['date_predicha']}", direccion,
+            help=f"Hecha el {str(latest_pred['predicted_at'])[:16]} con el modelo `{latest_pred['model_version']}`.",
+        )
         # Bug corregido 2026-09-09 (ver CONTEXTO.md "Probabilidad
         # mostrada para la dirección equivocada"): `predicted_probability`
         # guarda SIEMPRE P(sube), no la probabilidad de la dirección

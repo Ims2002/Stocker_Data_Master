@@ -30,8 +30,8 @@ sys.path.insert(0, str(_SRC_DIR))
 
 import db as dbmod  # noqa: E402
 import predict as predictmod  # noqa: E402
-from config import DEFAULT_PREDICTION_HORIZON, PREDICTION_HORIZONS  # noqa: E402
-from model import FEATURE_NAMES, build_feature_matrix, calibration_diagnostic  # noqa: E402
+from config import DATA_DIR, DEFAULT_PREDICTION_HORIZON, PREDICTION_HORIZONS, STALE_TICKER_DAYS  # noqa: E402
+from model import ALL_FEATURE_NAMES, calibration_diagnostic, features_for_model  # noqa: E402
 
 # Traducciones de las features técnicas a lenguaje llano para la UI (ver
 # CONTEXTO.md — el usuario pidió explícitamente que sea entendible para un
@@ -106,15 +106,39 @@ def get_engine() -> Engine:
     return dbmod.get_engine()
 
 
+def _current_tickers_subquery():
+    """Tickers con datos recientes: su última fecha en daily_prices está a
+    menos de STALE_TICKER_DAYS días naturales de la más reciente del
+    universo (auditoría, A2). Excluye deslistados como EA, cuyo último dato
+    es de agosto, y tickers cuya descarga lleva días fallando."""
+    from sqlalchemy import func
+
+    dp = dbmod.daily_prices
+    last_by_ticker = select(dp.c.ticker, func.max(dp.c.date).label("last_date")).group_by(dp.c.ticker).subquery()
+    global_max = select(func.max(dp.c.date)).scalar_subquery()
+    return select(last_by_ticker.c.ticker).where(
+        func.julianday(global_max) - func.julianday(last_by_ticker.c.last_date) <= STALE_TICKER_DAYS
+    )
+
+
 def list_tickers(engine: Engine) -> list[str]:
-    """Tickers con al menos una fila real en daily_prices (no solo los
-    listados en config.TICKERS — puede haber diferencias puntuales, p. ej.
-    justo tras corregir un ticker, ver CONTEXTO.md)."""
+    """Tickers con datos recientes en daily_prices (ver
+    `_current_tickers_subquery`), en orden alfabético."""
     with engine.begin() as conn:
-        rows = conn.execute(
-            select(dbmod.daily_prices.c.ticker).distinct().order_by(dbmod.daily_prices.c.ticker)
-        ).fetchall()
-    return [r[0] for r in rows]
+        rows = conn.execute(_current_tickers_subquery().order_by(text("ticker"))).fetchall()
+    return sorted(r[0] for r in rows)
+
+
+def get_pipeline_status() -> dict | None:
+    """Resultado de la última ejecución de `src/run_pipeline.py`
+    (`data/pipeline_status.json`), o None si no existe (p. ej. la demo)."""
+    import json
+
+    path = DATA_DIR / "pipeline_status.json"
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
 
 
 def ticker_logo_url(ticker: str, size: int = 48) -> str | None:
@@ -261,6 +285,17 @@ def get_latest_prediction(engine: Engine, ticker: str, horizon: int = DEFAULT_PR
     return None
 
 
+def latest_model_version(horizon: int = DEFAULT_PREDICTION_HORIZON) -> str | None:
+    """Nombre del modelo más reciente de un horizonte, o None. Las páginas lo
+    usan como clave de caché (auditoría, M4): con `@st.cache_resource` sin
+    clave, el dashboard seguía usando el modelo antiguo tras reentrenar hasta
+    reiniciar la app."""
+    try:
+        return predictmod.latest_model_path(horizon=horizon).stem
+    except FileNotFoundError:
+        return None
+
+
 def load_latest_model(horizon: int = DEFAULT_PREDICTION_HORIZON) -> dict:
     """Carga el .joblib del modelo más reciente de un horizonte concreto
     en MODELS_DIR (2026-08-13, ver CONTEXTO.md "Horizontes de predicción:
@@ -282,7 +317,7 @@ def predict_for_gold_rows(bundle: dict, gold_df: pd.DataFrame) -> pd.Series:
     gold_train/gold_inference (features en crudo) y devuelve la predicción
     binaria (0/1) por fila, en el mismo orden. Usa build_feature_matrix de
     model.py para no duplicar la lógica de construcción de features."""
-    x = build_feature_matrix(gold_df)
+    x = features_for_model(gold_df, bundle.get("feature_names") or ALL_FEATURE_NAMES)
     return pd.Series(bundle["model"].predict(x), index=gold_df.index)
 
 
@@ -307,6 +342,9 @@ def get_resolved_predictions(engine: Engine) -> pd.DataFrame:
         return df
     df["date_predicha"] = pd.to_datetime(df["date_predicha"])
     df["acierto"] = df["predicted_target_up_down"] == df["actual_target_up_down"]
+    # Baseline "siempre sube" en las mismas predicciones (auditoría, M1): sin
+    # referencia, un 48 % de acierto no dice si el modelo aporta algo.
+    df["acierto_siempre_sube"] = df["actual_target_up_down"] == 1
     return df
 
 
@@ -447,10 +485,21 @@ def get_market_sentiment_gauge(engine: Engine, days: int = 7) -> dict | None:
     if reciente.empty or total_articulos == 0:
         return None
     sentimiento = float((reciente["sentimiento_medio"] * reciente["n_articles"]).sum() / total_articulos)
+    # Cobertura real (auditoría, A3): cuántas acciones aportan artículos a
+    # esta cifra. Tras el backfill llegó a ser ~20 de 208 y la tarjeta decía
+    # "todo el universo".
+    with engine.begin() as conn:
+        n_tickers = conn.execute(
+            text("SELECT COUNT(DISTINCT ticker) FROM news_articles WHERE date >= :d"),
+            {"d": cutoff.date().isoformat()},
+        ).scalar() or 0
+        total_tickers = conn.execute(_current_tickers_subquery().subquery().select()).fetchall()
     return {
         "sentimiento": sentimiento,
         "n_articles": total_articulos,
         "n_dias": int(reciente["date"].nunique()),
+        "n_tickers": int(n_tickers),
+        "n_tickers_total": len(total_tickers),
         "label": sentiment_scalar_label(sentimiento),
     }
 
@@ -559,22 +608,31 @@ def feature_importances(bundle: dict) -> pd.DataFrame | None:
     reconocida (no debería pasar con random_forest/logistic, pero se
     comprueba explícitamente en vez de asumir)."""
     model = bundle["model"]
-    names = bundle.get("feature_names", FEATURE_NAMES)
+    names = bundle.get("feature_names") or ALL_FEATURE_NAMES
 
-    if hasattr(model, "feature_importances_"):
-        values = model.feature_importances_
+    # Preferencia (auditoría, M2): importancia por permutación sobre el test,
+    # guardada por model.py desde la revisión de auditoría. Mide cuánto baja
+    # el acierto fuera de entrenamiento al desordenar cada variable. La MDI de
+    # Random Forest queda como alternativa para modelos antiguos.
+    perm = bundle.get("permutation_importance")
+    if perm:
+        df = pd.DataFrame(perm).rename(columns={"mean": "importancia", "std": "desviacion"})
+        metodo = "permutacion"
+    elif hasattr(model, "feature_importances_"):
+        df = pd.DataFrame({"feature": names, "importancia": model.feature_importances_})
+        metodo = "mdi"
     elif hasattr(model, "coef_"):
-        values = abs(model.coef_[0])
+        df = pd.DataFrame({"feature": names, "importancia": abs(model.coef_[0])})
+        metodo = "coeficientes"
     else:
         return None
 
-    df = pd.DataFrame({
-        "feature": names,
-        "etiqueta": [FEATURE_LABELS.get(n, n) for n in names],
-        "explicacion": [FEATURE_EXPLANATIONS.get(n, "") for n in names],
-        "importancia": values,
-    })
-    return df.sort_values("importancia", ascending=False).reset_index(drop=True)
+    df["etiqueta"] = [FEATURE_LABELS.get(n, n) for n in df["feature"]]
+    df["explicacion"] = [FEATURE_EXPLANATIONS.get(n, "") for n in df["feature"]]
+    df.attrs["metodo"] = metodo
+    out = df.sort_values("importancia", ascending=False).reset_index(drop=True)
+    out.attrs["metodo"] = metodo
+    return out
 
 
 # --- Análisis adicionales sobre el test oficial (2026-08-17) ------------
@@ -607,7 +665,7 @@ def _test_set_predictions(engine: Engine, bundle: dict) -> pd.DataFrame:
     df = df[df[target_col].notna()].copy()
     if df.empty:
         return df
-    x = build_feature_matrix(df)
+    x = features_for_model(df, bundle.get("feature_names") or ALL_FEATURE_NAMES)
     proba_up = bundle["model"].predict_proba(x)[:, 1]
     df["proba_up"] = proba_up
     df["pred"] = (proba_up >= 0.5).astype(int)
@@ -774,6 +832,35 @@ def get_market_breadth_history(
     return resumen[resumen["date_predicha"] >= cutoff].reset_index(drop=True)
 
 
+def get_ticker_tape(engine: Engine, n: int = 14) -> list[tuple[str, float, float]]:
+    """Último cierre y variación diaria de los `n` primeros tickers de
+    `config.TICKERS` (los de mayor capitalización) para la cinta de
+    cotizaciones del modo terminal (rediseño 2026-09-17). Solo tickers con
+    las dos últimas sesiones cargadas."""
+    from config import TICKERS
+
+    tickers = TICKERS[:n]
+    query = text(
+        """
+        SELECT ticker, date, close FROM (
+            SELECT ticker, date, close,
+                   ROW_NUMBER() OVER (PARTITION BY ticker ORDER BY date DESC) AS rn
+            FROM daily_prices WHERE ticker IN ({})
+        ) WHERE rn <= 2
+        """.format(", ".join(f":t{i}" for i in range(len(tickers))))
+    )
+    with engine.begin() as conn:
+        rows = conn.execute(query, {f"t{i}": t for i, t in enumerate(tickers)}).fetchall()
+    df = pd.DataFrame(rows, columns=["ticker", "date", "close"]).sort_values(["ticker", "date"])
+    out = []
+    for ticker in tickers:
+        sub = df[df["ticker"] == ticker]
+        if len(sub) == 2:
+            prev, last = float(sub["close"].iloc[0]), float(sub["close"].iloc[1])
+            out.append((ticker, last, last / prev - 1))
+    return out
+
+
 def get_tickers_by_sector(engine: Engine) -> pd.DataFrame:
     """Tickers con datos reales (mismo criterio que `list_tickers`: solo
     los que tienen fila en `daily_prices`, para no listar los huérfanos
@@ -783,7 +870,7 @@ def get_tickers_by_sector(engine: Engine) -> pd.DataFrame:
     with engine.begin() as conn:
         rows = conn.execute(
             select(dbmod.stocks.c.ticker, dbmod.stocks.c.nombre, dbmod.stocks.c.sector)
-            .where(dbmod.stocks.c.ticker.in_(select(dbmod.daily_prices.c.ticker).distinct()))
+            .where(dbmod.stocks.c.ticker.in_(_current_tickers_subquery()))
             .order_by(dbmod.stocks.c.ticker)
         ).fetchall()
     return pd.DataFrame(rows, columns=["ticker", "nombre", "sector"])

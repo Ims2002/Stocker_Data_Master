@@ -25,6 +25,7 @@ import streamlit as st
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import data_access as da  # noqa: E402
+import ui  # noqa: E402
 
 st.title("¿Sigue funcionando en el día a día?")
 st.markdown(
@@ -70,6 +71,7 @@ resumen = (
         dias_de_mercado=("date_predicha", "nunique"),
         n_predicciones=("acierto", "size"),
         acierto=("acierto", "mean"),
+        acierto_siempre_sube=("acierto_siempre_sube", "mean"),
     )
     .sort_values("ultima_fecha")
     .reset_index()
@@ -81,11 +83,13 @@ resumen_view = resumen.rename(columns={
     "dias_de_mercado": "Sesiones de mercado",
     "n_predicciones": "Predicciones resueltas",
     "acierto": "Acierto real",
+    "acierto_siempre_sube": "Referencia: siempre sube",
 })
 resumen_view["Desde"] = resumen_view["Desde"].dt.date.astype(str)
 resumen_view["Hasta"] = resumen_view["Hasta"].dt.date.astype(str)
-resumen_view["Acierto real"] = (resumen_view["Acierto real"] * 100).round(1).astype(str) + " %"
-with st.container(border=True):
+for _col in ("Acierto real", "Referencia: siempre sube"):
+    resumen_view[_col] = (resumen_view[_col] * 100).round(1).astype(str) + " %"
+with ui.card("resumen_versiones"):
     st.dataframe(resumen_view, width="stretch", hide_index=True)
 
 st.caption(
@@ -94,6 +98,13 @@ st.caption(
     "mide el tamaño de la muestra es \"Sesiones de mercado\", no \"Predicciones resueltas\". Con pocas "
     "sesiones, el acierto real puede moverse mucho de una versión a otra sin que signifique nada todavía "
     "— ver CONTEXTO.md, \"Seguimiento real de predicciones\"."
+)
+
+st.caption(
+    "«Referencia: siempre sube» es el acierto que habría tenido decir «sube» en todas las mismas "
+    "predicciones (auditoría, M1): si el modelo no la supera, no aporta nada sobre una regla trivial. Desde la revisión, las "
+    "predicciones solo se resuelven con cierres definitivos; las anteriores se recalcularon con "
+    "`track_predictions.py --reresolve`."
 )
 
 st.divider()
@@ -115,18 +126,17 @@ fig = go.Figure()
 fig.add_trace(
     go.Bar(
         x=por_dia["date_predicha"], y=por_dia["acierto"], name="Acierto real",
-        marker_color="#1D4ED8",
+        marker_color=[ui.pal()["up"] if v >= 0.5 else ui.pal()["down"] for v in por_dia["acierto"]],
     )
 )
-fig.add_hline(y=0.5, line_dash="dot", line_color="#9CA3AF", annotation_text="mitad = como tirar una moneda")
-fig.update_layout(
-    height=380, margin=dict(l=10, r=10, t=20, b=10),
-    yaxis=dict(title="Acierto", range=[0, 1], tickformat=".0%"),
-    xaxis_title=None,
-    plot_bgcolor="#FFFFFF", paper_bgcolor="#FFFFFF",
+fig.add_hline(
+    y=0.5, line_dash="dot", line_color=ui.pal()["muted"], annotation_text="mitad = como tirar una moneda",
+    annotation_font_color=ui.pal()["muted"],
 )
-with st.container(border=True):
-    st.plotly_chart(fig, width="stretch")
+ui.style_fig(fig, height=380, xaxis_title=None)
+fig.update_yaxes(title="Acierto", range=[0, 1], tickformat=".0%")
+with ui.card("evolucion_real"):
+    ui.plotly_chart(fig)
 
 with st.expander("Ver el detalle día a día (predicho vs. real)"):
     detalle = por_dia.rename(columns={

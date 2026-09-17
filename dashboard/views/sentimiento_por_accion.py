@@ -32,6 +32,7 @@ import streamlit as st
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import data_access as da  # noqa: E402
+import ui  # noqa: E402
 
 st.title("Noticias y sentimiento de una acción")
 st.caption(
@@ -105,7 +106,7 @@ if daily.empty:
 n_articulos = int(daily["n_articles"].sum())
 sentimiento_medio = (daily["avg_sentiment_score"] * daily["n_articles"]).sum() / n_articulos
 
-with st.container(border=True):
+with ui.card("kpis_noticias"):
     col1, col2, col3 = st.columns(3)
     col1.metric("Artículos (últimos 6 meses)", n_articulos)
     col2.metric("Tono medio", f"{sentimiento_medio:+.2f}", help="De -1 (muy negativo) a +1 (muy positivo)")
@@ -117,26 +118,22 @@ st.divider()
 st.subheader("Tendencia")
 fig = make_subplots(specs=[[{"secondary_y": True}]])
 fig.add_trace(
-    go.Bar(x=daily["date"], y=daily["n_articles"], name="Nº de artículos", marker_color="#EEF0F2"),
+    go.Bar(x=daily["date"], y=daily["n_articles"], name="Nº de artículos", marker_color=ui.pal()["line"]),
     secondary_y=False,
 )
 fig.add_trace(
     go.Scatter(
         x=daily["date"], y=daily["avg_sentiment_score"], name="Tono medio", mode="lines+markers",
-        line=dict(color="#1D4ED8", width=2), marker=dict(size=5),
+        line=dict(color=ui.pal()["accent"], width=2), marker=dict(size=5),
     ),
     secondary_y=True,
 )
-fig.add_hline(y=0, line_dash="dot", line_color="#9CA3AF", secondary_y=True)
-fig.update_yaxes(title_text="Nº de artículos", secondary_y=False, showgrid=False)
-fig.update_yaxes(title_text="Tono medio (-1 a +1)", secondary_y=True, range=[-1, 1])
-fig.update_layout(
-    height=420, margin=dict(l=10, r=10, t=20, b=10),
-    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
-    plot_bgcolor="#FFFFFF", paper_bgcolor="#FFFFFF",
-)
-with st.container(border=True):
-    st.plotly_chart(fig, width="stretch")
+fig.add_hline(y=0, line_dash="dot", line_color=ui.pal()["muted"], secondary_y=True)
+ui.style_fig(fig, height=420)
+fig.update_yaxes(title_text="Nº de artículos", secondary_y=False, showgrid=False, side="left")
+fig.update_yaxes(title_text="Tono medio (-1 a +1)", secondary_y=True, range=[-1, 1], side="right", showgrid=False)
+with ui.card("tendencia_noticias"):
+    ui.plotly_chart(fig)
 
 st.divider()
 
@@ -160,18 +157,20 @@ if articulos.empty:
         icon="🔎",
     )
 
-_color_by_label = {
-    "Bullish": "#2ca02c", "Somewhat-Bullish": "#86c98a",
-    "Neutral": "#9CA3AF",
-    "Somewhat-Bearish": "#e79a97", "Bearish": "#d62728",
-}
-for _, row in articulos.iterrows():
+for i, (_, row) in enumerate(articulos.iterrows()):
     label = row["ticker_sentiment_label"]
-    color = _color_by_label.get(label, "#9CA3AF")
+    color = ui.sentiment_color(label)
     label_es = da.SENTIMENT_LABEL_ES.get(label, label)
-    with st.container(border=True):
+    with ui.card(f"titular_{i}"):
         col_a, col_b = st.columns([5, 1])
-        col_a.markdown(f"**{row['title']}**")
+        # Enlace al artículo original (auditoría, U4). El título viene de una
+        # API externa: se quitan los caracteres que Markdown interpretaría.
+        _titulo = str(row["title"] or "Sin título").replace("[", "(").replace("]", ")").replace("*", "")
+        _url = str(row.get("url") or "")
+        if _url.startswith(("https://", "http://")):
+            col_a.markdown(f"**[{_titulo}]({_url.replace(')', '%29')})**")
+        else:
+            col_a.markdown(f"**{_titulo}**")
         col_a.caption(f"{row['source'] or 'fuente desconocida'} · {row['date']} · relevancia {row['relevance_score']:.0%}")
         col_b.markdown(
             f"<span style='color:{color}; font-weight:500;'>{label_es}</span>",

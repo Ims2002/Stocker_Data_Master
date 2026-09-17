@@ -6,8 +6,9 @@ CONTEXTO.md):
 
 - `gold_train`: todas las fechas salvo la última, con `close_next_day` y
   `target_up_down` ya calculados — la variable objetivo se construye
-  desplazando el `Close` (no `adj_close`) un día hacia atrás, tal como fija
-  CONTEXTO.md.
+  desplazando el `adj_close` hacia atrás tantas sesiones como el horizonte
+  (hasta la auditoría del 16/09/2026 se usaba `Close`; ver
+  `build_gold_frames`).
 - `gold_inference`: SOLO la última fecha disponible, solo features, sin
   ninguna columna de label — ni siquiera vacía.
 
@@ -34,6 +35,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import db as dbmod  # noqa: E402
 from config import MIN_HISTORY_ROWS_FOR_GOLD, PREDICTION_HORIZONS, TICKERS  # noqa: E402
 from features import ROLLING_FEATURE_COLUMNS, attach_news_features, compute_features  # noqa: E402
+
+# Precio sobre el que se construye el target (ver build_gold_frames).
+TARGET_PRICE_COLUMN = "adj_close"
 
 # Nombre de columna (close_Nd, target_up_down_Nd) por horizonte (sesiones
 # de mercado) — horizonte 1 usa los nombres históricos sin sufijo
@@ -126,17 +130,27 @@ def build_gold_frames(
     feat = compute_features(raw)
     feat = attach_news_features(feat, news)
 
-    # Targets por horizonte: shift(-N sesiones) sobre Close (no adj_close),
-    # tal como fija CONTEXTO.md para el horizonte de 1 sesión, generalizado
+    # Targets por horizonte: shift(-N sesiones) sobre TARGET_PRICE_COLUMN,
+    # generalizado desde el horizonte de 1 sesión
     # a 5/20 (ver CONTEXTO.md, "Horizontes de predicción: semana y mes",
     # 2026-08-13). IMPORTANTE: una comparación normal `(close_nd > close)`
     # con NaN a la izquierda devuelve False, no NaN (comportamiento de
     # numpy) — sin el `.where()` de abajo, las últimas N-1 filas de cada
     # ticker (dentro de las que sí entran en train, ver `is_last` más
     # abajo) quedarían mal etiquetadas como "baja" en vez de excluidas.
+    #
+    # CAMBIO (auditoría 16/09/2026, M3): el target se calcula sobre
+    # `adj_close`, no sobre `close`. Con `close`, el día ex-dividendo el
+    # precio cae por el pago y la fila se etiquetaba como "baja" sin que el
+    # accionista perdiera nada; además las features ya usaban `adj_close`.
+    # Solo es fiable ahora que load.py recarga el histórico completo cuando
+    # yfinance reajusta `adj_close` (C3). Las columnas conservan su nombre
+    # (`close_next_day`, `close_5d`, `close_20d`) para no migrar el esquema,
+    # pero guardan el `adj_close` futuro. `track_predictions.py` usa el
+    # mismo criterio.
     for horizon, (close_col, target_col) in HORIZON_COLUMNS.items():
-        feat[close_col] = feat["close"].shift(-horizon)
-        raw_target = (feat[close_col] > feat["close"]).astype("float")
+        feat[close_col] = feat[TARGET_PRICE_COLUMN].shift(-horizon)
+        raw_target = (feat[close_col] > feat[TARGET_PRICE_COLUMN]).astype("float")
         feat[target_col] = raw_target.where(feat[close_col].notna())
 
     complete = feat[ROLLING_FEATURE_COLUMNS].notna().all(axis=1)

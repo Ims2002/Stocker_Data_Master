@@ -50,12 +50,20 @@ import numpy as np
 import pandas as pd
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import accuracy_score, precision_score, recall_score
+from sklearn.metrics import accuracy_score, brier_score_loss, log_loss, precision_score, recall_score, roc_auc_score
 from sqlalchemy.engine import Engine
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import db as dbmod  # noqa: E402
-from config import DEFAULT_PREDICTION_HORIZON, MODELS_DIR, PREDICTION_HORIZONS, TEST_PERIOD_MONTHS  # noqa: E402
+from config import (  # noqa: E402
+    DEFAULT_PREDICTION_HORIZON,
+    MODEL_USE_NEWS_FEATURES,
+    MODELS_DIR,
+    PERMUTATION_IMPORTANCE_REPEATS,
+    PERMUTATION_IMPORTANCE_SAMPLE,
+    PREDICTION_HORIZONS,
+    TEST_PERIOD_MONTHS,
+)
 from gold import HORIZON_COLUMNS  # noqa: E402
 
 def read_gold_train(engine: Engine) -> pd.DataFrame:
@@ -69,7 +77,19 @@ def read_gold_train(engine: Engine) -> pd.DataFrame:
         result = conn.execute(dbmod.gold_train.select().order_by(dbmod.gold_train.c.date))
         rows = result.fetchall()
         columns = result.keys()
-    return pd.DataFrame(rows, columns=columns)
+    df = pd.DataFrame(rows, columns=columns)
+    # Defensa ante el caso real de la auditoría (C1): con el índice de
+    # gold_train corrupto llegó a haber 8.042 filas duplicadas, con las que
+    # se entrenaba sin saberlo.
+    n_dup = int(df.duplicated(["ticker", "date"]).sum()) if not df.empty else 0
+    if n_dup:
+        print(
+            f"[model] AVISO: {n_dup} fila(s) duplicadas en gold_train — se descartan. "
+            "Ejecuta `python src/maintenance.py check`.",
+            file=sys.stderr,
+        )
+        df = df.drop_duplicates(["ticker", "date"], keep="last")
+    return df
 
 
 def build_feature_matrix(df: pd.DataFrame) -> pd.DataFrame:
@@ -193,13 +213,31 @@ def build_feature_matrix(df: pd.DataFrame) -> pd.DataFrame:
     return x
 
 
-FEATURE_NAMES = [
+NEWS_FEATURE_NAMES = ["news_sentiment_3d", "news_volume_log"]
+
+# Todas las columnas que construye `build_feature_matrix`.
+ALL_FEATURE_NAMES = [
     "return_1d", "return_5d", "return_20d", "volatility_10d",
     "close_to_ma5", "close_to_ma10", "close_to_ma20",
     "rsi_14", "macd_hist_norm", "bb_pct_b", "bb_width",
     "log_volume", "relative_volume", "day_of_week",
-    "news_sentiment_3d", "news_volume_log",
+    *NEWS_FEATURE_NAMES,
 ]
+
+# Las que usa un modelo NUEVO (auditoría, A3: sin noticias por defecto, ver
+# config.MODEL_USE_NEWS_FEATURES). Cada bundle guarda su propia lista en
+# `feature_names`, y `predict.py`/el dashboard seleccionan esas columnas —
+# así los modelos antiguos (16 features) y los nuevos (14) conviven.
+FEATURE_NAMES = ALL_FEATURE_NAMES if MODEL_USE_NEWS_FEATURES else [
+    f for f in ALL_FEATURE_NAMES if f not in NEWS_FEATURE_NAMES
+]
+
+
+def features_for_model(df: pd.DataFrame, feature_names: list[str] | None = None) -> pd.DataFrame:
+    """Matriz X con exactamente las columnas (y el orden) con que se entrenó
+    el modelo. `feature_names=None` usa FEATURE_NAMES (modelo nuevo)."""
+    x = build_feature_matrix(df)
+    return x[list(feature_names or FEATURE_NAMES)]
 
 
 def temporal_split(
@@ -248,18 +286,58 @@ def majority_baseline(train_y: pd.Series, test_len: int) -> np.ndarray:
     return np.full(test_len, majority)
 
 
-def persistence_baseline(test_df: pd.DataFrame) -> np.ndarray:
-    """Predice que mañana repite la tendencia de hoy: signo de
-    `return_1d` (retorno de hoy respecto a ayer, ya calculado en gold)."""
-    return (test_df["return_1d"] > 0).astype(int).to_numpy()
+# Retorno "del mismo plazo" que el horizonte, para el baseline de persistencia.
+_PERSISTENCE_RETURN_COLUMN = {1: "return_1d", 5: "return_5d", 20: "return_20d"}
 
 
-def evaluate(y_true: np.ndarray, y_pred: np.ndarray) -> dict:
-    return {
-        "accuracy": accuracy_score(y_true, y_pred),
-        "precision": precision_score(y_true, y_pred, zero_division=0),
-        "recall": recall_score(y_true, y_pred, zero_division=0),
+def persistence_baseline(test_df: pd.DataFrame, horizon: int = DEFAULT_PREDICTION_HORIZON) -> np.ndarray:
+    """Predice que el próximo periodo repite la tendencia del último periodo
+    del mismo plazo: signo de `return_1d` para el horizonte día, de
+    `return_5d` para semana y de `return_20d` para mes.
+
+    CAMBIO (auditoría 16/09/2026, M1): antes se usaba `return_1d` en los tres
+    horizontes, un baseline más débil de lo justo a 5 y 20 sesiones, donde el
+    momentum del mismo plazo es la referencia natural."""
+    col = _PERSISTENCE_RETURN_COLUMN.get(horizon, "return_1d")
+    return (test_df[col] > 0).astype(int).to_numpy()
+
+
+def evaluate(y_true: np.ndarray, y_pred: np.ndarray, proba_up: np.ndarray | None = None) -> dict:
+    """Accuracy, precision y recall; con `proba_up`, también ROC AUC, log
+    loss y Brier (auditoría, M1): la accuracy con umbral 0,5 no dice si las
+    probabilidades ordenan bien los casos. Los baselines no tienen
+    probabilidad, así que para ellos solo se calculan las tres primeras."""
+    out = {
+        "accuracy": float(accuracy_score(y_true, y_pred)),
+        "precision": float(precision_score(y_true, y_pred, zero_division=0)),
+        "recall": float(recall_score(y_true, y_pred, zero_division=0)),
     }
+    if proba_up is not None and len(np.unique(y_true)) == 2:
+        proba = np.clip(np.asarray(proba_up, dtype=float), 1e-6, 1 - 1e-6)
+        out["roc_auc"] = float(roc_auc_score(y_true, proba))
+        out["log_loss"] = float(log_loss(y_true, proba, labels=[0, 1]))
+        out["brier"] = float(brier_score_loss(y_true, proba))
+    return out
+
+
+def permutation_importance_on_test(model, x_test: pd.DataFrame, y_test: pd.Series, random_state: int = 42) -> list[dict]:
+    """Importancia por permutación sobre (una muestra de) el test (auditoría,
+    M2): cuánto baja la accuracy al desordenar cada variable. A diferencia de
+    la importancia MDI de Random Forest, no favorece a las variables
+    continuas y mide lo que el modelo aprovecha fuera de entrenamiento."""
+    from sklearn.inspection import permutation_importance
+
+    if len(x_test) > PERMUTATION_IMPORTANCE_SAMPLE:
+        idx = x_test.sample(PERMUTATION_IMPORTANCE_SAMPLE, random_state=random_state).index
+        x_test, y_test = x_test.loc[idx], y_test.loc[idx]
+    result = permutation_importance(
+        model, x_test, y_test, scoring="accuracy",
+        n_repeats=PERMUTATION_IMPORTANCE_REPEATS, random_state=random_state, n_jobs=-1,
+    )
+    return [
+        {"feature": name, "mean": float(m), "std": float(sd)}
+        for name, m, sd in zip(x_test.columns, result.importances_mean, result.importances_std)
+    ]
 
 
 def calibration_diagnostic(y_true, proba_up: np.ndarray, n_bins: int = 10) -> dict | None:
@@ -334,14 +412,18 @@ def calibration_diagnostic(y_true, proba_up: np.ndarray, n_bins: int = 10) -> di
     return {"brier_score": brier, "reliability_table": reliability_table}
 
 
-def _build_model(model_type: str):
+def _build_model(model_type: str, class_weight: str | None = "balanced"):
+    """`class_weight` (auditoría, M1): "balanced" empuja al modelo hacia la
+    clase minoritaria y resta accuracy frente al baseline mayoritario, que es
+    precisamente la métrica elegida. Se deja como opción (`--class-weight
+    none`) para poder comparar ambos en igualdad de condiciones."""
     if model_type == "random_forest":
         return RandomForestClassifier(
             n_estimators=300, max_depth=8, min_samples_leaf=20,
-            random_state=42, n_jobs=-1, class_weight="balanced",
+            random_state=42, n_jobs=-1, class_weight=class_weight,
         )
     if model_type == "logistic":
-        return LogisticRegression(max_iter=1000, class_weight="balanced")
+        return LogisticRegression(max_iter=1000, class_weight=class_weight)
     if model_type == "lightgbm":
         # Import perezoso: lightgbm es una dependencia OPCIONAL (ver
         # requirements.txt) — el resto del pipeline (random_forest,
@@ -352,14 +434,15 @@ def _build_model(model_type: str):
 
         return LGBMClassifier(
             n_estimators=300, num_leaves=31, learning_rate=0.05,
-            min_child_samples=50, class_weight="balanced",
+            min_child_samples=50, class_weight=class_weight,
             random_state=42, n_jobs=-1, verbosity=-1,
         )
     raise ValueError(f"model_type desconocido: {model_type!r}")
 
 
 def train_and_evaluate(
-    df: pd.DataFrame, model_type: str = "random_forest", horizon: int = DEFAULT_PREDICTION_HORIZON
+    df: pd.DataFrame, model_type: str = "random_forest", horizon: int = DEFAULT_PREDICTION_HORIZON,
+    class_weight: str | None = "balanced", permutation: bool = True,
 ) -> dict:
     """Entrena el modelo con split temporal y devuelve un dict con el
     modelo entrenado, las métricas del modelo y de ambos baselines sobre
@@ -393,30 +476,34 @@ def train_and_evaluate(
             f"{TEST_PERIOD_MONTHS} meses?"
         )
 
-    x_train = build_feature_matrix(train_df)
-    x_test = build_feature_matrix(test_df)
+    x_train = features_for_model(train_df)
+    x_test = features_for_model(test_df)
     y_train = train_df[target_col].astype(int)
     y_test = test_df[target_col].astype(int)
 
-    model = _build_model(model_type)
+    model = _build_model(model_type, class_weight=class_weight)
     model.fit(x_train, y_train)
     y_pred_model = model.predict(x_test)
     proba_up_test = model.predict_proba(x_test)[:, 1]
 
     y_pred_majority = majority_baseline(y_train, len(y_test))
-    y_pred_persistence = persistence_baseline(test_df)
+    y_pred_persistence = persistence_baseline(test_df, horizon=horizon)
 
     return {
         "model": model,
         "model_type": model_type,
         "horizon": horizon,
-        "feature_names": FEATURE_NAMES,
+        "class_weight": class_weight,
+        "feature_names": list(FEATURE_NAMES),
+        "permutation_importance": (
+            permutation_importance_on_test(model, x_test, y_test) if permutation else None
+        ),
         "train_rows": len(train_df),
         "test_rows": len(test_df),
         "train_date_max": str(train_df["date"].max()),
         "test_date_min": str(test_df["date"].min()),
         "test_date_max": str(test_df["date"].max()),
-        "metrics_model": evaluate(y_test, y_pred_model),
+        "metrics_model": evaluate(y_test, y_pred_model, proba_up_test),
         "metrics_majority_baseline": evaluate(y_test, y_pred_majority),
         "metrics_persistence_baseline": evaluate(y_test, y_pred_persistence),
         "calibration": calibration_diagnostic(y_test, proba_up_test),
@@ -547,9 +634,9 @@ def tune_lightgbm(
         params = _sample_lgb_params(rng)
         fold_scores = []
         for train_mask, val_mask in folds:
-            x_tr = build_feature_matrix(train_df[train_mask])
+            x_tr = features_for_model(train_df[train_mask])
             y_tr = train_df.loc[train_mask, target_col].astype(int)
-            x_val = build_feature_matrix(train_df[val_mask])
+            x_val = features_for_model(train_df[val_mask])
             y_val = train_df.loc[val_mask, target_col].astype(int)
             fold_model = _make_lgbm(params, random_state)
             fold_model.fit(x_tr, y_tr)
@@ -560,8 +647,8 @@ def tune_lightgbm(
             best_score = mean_score
             best_params = params
 
-    x_train = build_feature_matrix(train_df)
-    x_test = build_feature_matrix(test_df)
+    x_train = features_for_model(train_df)
+    x_test = features_for_model(test_df)
     y_train = train_df[target_col].astype(int)
     y_test = test_df[target_col].astype(int)
 
@@ -571,19 +658,21 @@ def tune_lightgbm(
     proba_up_test = final_model.predict_proba(x_test)[:, 1]
 
     y_pred_majority = majority_baseline(y_train, len(y_test))
-    y_pred_persistence = persistence_baseline(test_df)
+    y_pred_persistence = persistence_baseline(test_df, horizon=horizon)
 
     return {
         "model": final_model,
         "model_type": "lightgbm",
         "horizon": horizon,
-        "feature_names": FEATURE_NAMES,
+        "class_weight": "balanced",
+        "feature_names": list(FEATURE_NAMES),
+        "permutation_importance": permutation_importance_on_test(final_model, x_test, y_test),
         "train_rows": len(train_df),
         "test_rows": len(test_df),
         "train_date_max": str(train_df["date"].max()),
         "test_date_min": str(test_df["date"].min()),
         "test_date_max": str(test_df["date"].max()),
-        "metrics_model": evaluate(y_test, y_pred_model),
+        "metrics_model": evaluate(y_test, y_pred_model, proba_up_test),
         "metrics_majority_baseline": evaluate(y_test, y_pred_majority),
         "metrics_persistence_baseline": evaluate(y_test, y_pred_persistence),
         "calibration": calibration_diagnostic(y_test, proba_up_test),
@@ -637,6 +726,9 @@ def save_model(result: dict) -> tuple[str, Path]:
         "metrics_majority_baseline": result["metrics_majority_baseline"],
         "metrics_persistence_baseline": result["metrics_persistence_baseline"],
         "calibration": result.get("calibration"),
+        "class_weight": result.get("class_weight"),
+        "permutation_importance": result.get("permutation_importance"),
+        "target_price_column": "adj_close",
         "trained_at": datetime.now().isoformat(),
     }
     if "best_params" in result:
@@ -665,8 +757,12 @@ def print_report(result: dict) -> None:
         ("baseline persistencia", "metrics_persistence_baseline"),
     ):
         m = result[key]
+        extra = (
+            f"  auc={m['roc_auc']:.3f}  logloss={m['log_loss']:.4f}  brier={m['brier']:.4f}"
+            if "roc_auc" in m else ""
+        )
         print(
-            f"[model]   {label:<28} acc={m['accuracy']:.3f}  prec={m['precision']:.3f}  rec={m['recall']:.3f}",
+            f"[model]   {label:<28} acc={m['accuracy']:.3f}  prec={m['precision']:.3f}  rec={m['recall']:.3f}{extra}",
             file=sys.stderr,
         )
     calibration = result.get("calibration")
@@ -714,6 +810,14 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--tune-iterations", type=int, default=20, help="combinaciones a probar con --tune")
     parser.add_argument(
+        "--class-weight", choices=["balanced", "none"], default="balanced",
+        help="ponderación de clases (auditoría M1: 'none' suele dar más accuracy frente al baseline mayoritario)",
+    )
+    parser.add_argument(
+        "--no-permutation", action="store_true",
+        help="no calcular la importancia por permutación sobre el test (ahorra unos minutos)",
+    )
+    parser.add_argument(
         "--horizon", type=int, choices=sorted(PREDICTION_HORIZONS), default=DEFAULT_PREDICTION_HORIZON,
         help="sesiones de mercado vista: 1=día (por defecto), 5=semana, 20=mes "
         "(ver CONTEXTO.md, 'Horizontes de predicción: semana y mes')",
@@ -733,7 +837,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.tune:
         result = tune_lightgbm(df, n_iter=args.tune_iterations, horizon=args.horizon)
     else:
-        result = train_and_evaluate(df, model_type=args.model, horizon=args.horizon)
+        result = train_and_evaluate(
+            df, model_type=args.model, horizon=args.horizon,
+            class_weight=None if args.class_weight == "none" else args.class_weight,
+            permutation=not args.no_permutation,
+        )
     print_report(result)
     model_version, path = save_model(result)
     print(f"[model] modelo guardado: {model_version} -> {path}", file=sys.stderr)

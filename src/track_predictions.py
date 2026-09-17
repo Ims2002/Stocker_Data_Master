@@ -33,8 +33,22 @@ anterior a `date_predicha`.
 Empates (`close(date_predicha) == close(sesión de origen)`) cuentan como
 "baja/igual" (target_up_down=0), igual que en gold.py.
 
+Revisión de auditoría (16/09/2026):
+- C2: solo se resuelven fechas cuya sesión ya ha cerrado. Antes, con el
+  pipeline corriendo a media sesión, se resolvía con un cierre parcial y,
+  como las filas resueltas no se vuelven a tocar, el error quedaba para
+  siempre (507 de 4.544 resultados incorrectos).
+- M3: el resultado se calcula con `adj_close`, igual que el nuevo target de
+  gold.py.
+- M5: si la predicción guarda `date_origen`, se compara contra esa fecha
+  exacta; si no (predicciones antiguas), contra la fila `horizon` sesiones
+  antes, como hasta ahora.
+- `--reresolve` vuelve a calcular TODAS las predicciones resueltas (usar una
+  vez tras corregir los datos con `load.py --refresh-all`).
+
 Uso:
     python track_predictions.py
+    python track_predictions.py --reresolve
 
 Pensado para ejecutarse a diario, después de `load.py` (o en el mismo
 cron/tarea programada), para que las predicciones vayan quedando
@@ -45,6 +59,7 @@ ya resuelta no se vuelve a tocar (solo se leen las que tienen
 
 from __future__ import annotations
 
+import argparse
 import sys
 from pathlib import Path
 
@@ -54,7 +69,11 @@ from sqlalchemy.engine import Engine
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import db as dbmod  # noqa: E402
+import market_time  # noqa: E402
 from predict import horizon_from_model_version  # noqa: E402
+
+# Precio con el que se decide "subió / no subió" (mismo que gold.TARGET_PRICE_COLUMN).
+PRICE_COLUMN = "adj_close"
 
 
 def read_pending_predictions(engine: Engine) -> pd.DataFrame:
@@ -66,6 +85,7 @@ def read_pending_predictions(engine: Engine) -> pd.DataFrame:
         dbmod.predictions.c.ticker,
         dbmod.predictions.c.date_predicha,
         dbmod.predictions.c.model_version,
+        dbmod.predictions.c.date_origen,
     ).where(dbmod.predictions.c.actual_target_up_down.is_(None))
     with engine.begin() as conn:
         result = conn.execute(query)
@@ -75,13 +95,19 @@ def read_pending_predictions(engine: Engine) -> pd.DataFrame:
 
 
 def read_closes_for_tickers(tickers: list[str], engine: Engine) -> pd.DataFrame:
-    """Histórico de cierres (`ticker`, `date`, `close`) para los tickers
-    dados, ordenado por ticker y fecha ascendente — lo mínimo necesario
-    para resolver predicciones, no todo `daily_prices`."""
+    """Histórico de cierres ajustados (`ticker`, `date`, `close`) para los
+    tickers dados, ordenado por ticker y fecha ascendente — lo mínimo
+    necesario para resolver predicciones, no todo `daily_prices`. La
+    columna se llama `close` por compatibilidad, pero contiene
+    PRICE_COLUMN."""
     if not tickers:
         return pd.DataFrame(columns=["ticker", "date", "close"])
     query = (
-        select(dbmod.daily_prices.c.ticker, dbmod.daily_prices.c.date, dbmod.daily_prices.c.close)
+        select(
+            dbmod.daily_prices.c.ticker,
+            dbmod.daily_prices.c.date,
+            dbmod.daily_prices.c[PRICE_COLUMN].label("close"),
+        )
         .where(dbmod.daily_prices.c.ticker.in_(tickers))
         .order_by(dbmod.daily_prices.c.ticker, dbmod.daily_prices.c.date)
     )
@@ -92,7 +118,7 @@ def read_closes_for_tickers(tickers: list[str], engine: Engine) -> pd.DataFrame:
     return pd.DataFrame(rows, columns=columns)
 
 
-def resolve_predictions(pending: pd.DataFrame, closes: pd.DataFrame) -> pd.DataFrame:
+def resolve_predictions(pending: pd.DataFrame, closes: pd.DataFrame, now=None) -> pd.DataFrame:
     """Cruza `pending` con `closes` y devuelve solo las filas que ya se
     pueden resolver (con `actual_target_up_down` calculado), listas para
     actualizar en `predictions`. Las que aún no tienen el cierre real
@@ -101,6 +127,7 @@ def resolve_predictions(pending: pd.DataFrame, closes: pd.DataFrame) -> pd.DataF
     if pending.empty or closes.empty:
         return pending.iloc[0:0].assign(actual_target_up_down=pd.Series(dtype="int"))
 
+    last_closed = market_time.last_closed_session(now=now)
     resolved_rows = []
     for ticker, group in closes.groupby("ticker", sort=False):
         series = group.set_index("date")["close"].sort_index()
@@ -109,13 +136,21 @@ def resolve_predictions(pending: pd.DataFrame, closes: pd.DataFrame) -> pd.DataF
             date_predicha = row["date_predicha"]
             if date_predicha not in series.index:
                 continue  # el cierre de ese día todavía no está en daily_prices
-            horizon = horizon_from_model_version(row["model_version"])
+            if date_predicha > last_closed:
+                continue  # sesión en curso: el precio guardado no es definitivo (C2)
             pos = series.index.get_loc(date_predicha)
-            origin_pos = pos - horizon
-            if origin_pos < 0:
-                continue  # no hay suficiente histórico anterior para este horizonte/ticker
+            date_origen = row.get("date_origen")
+            if date_origen is not None and not pd.isna(date_origen):
+                if date_origen not in series.index:
+                    continue  # falta el cierre de la sesión de origen
+                close_origin = series.loc[date_origen]
+            else:
+                horizon = horizon_from_model_version(row["model_version"])
+                origin_pos = pos - horizon
+                if origin_pos < 0:
+                    continue  # no hay suficiente histórico anterior para este horizonte/ticker
+                close_origin = series.iloc[origin_pos]
             close_today = series.iloc[pos]
-            close_origin = series.iloc[origin_pos]
             actual = int(close_today > close_origin)
             resolved_rows.append(
                 {
@@ -144,9 +179,29 @@ def update_actuals(resolved: pd.DataFrame, engine: Engine) -> int:
     return len(resolved)
 
 
+def reset_resolved(engine: Engine) -> int:
+    """Vuelve a poner a NULL todos los resultados reales ya calculados, para
+    recalcularlos con los datos corregidos."""
+    with engine.begin() as conn:
+        result = conn.execute(
+            dbmod.predictions.update()
+            .where(dbmod.predictions.c.actual_target_up_down.is_not(None))
+            .values(actual_target_up_down=None)
+        )
+    return result.rowcount or 0
+
+
 def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--reresolve", action="store_true", help="recalcula también las predicciones ya resueltas")
+    args = parser.parse_args(argv)
+
     engine = dbmod.get_engine()
     dbmod.init_db(engine)
+
+    if args.reresolve:
+        n_reset = reset_resolved(engine)
+        print(f"[track_predictions] {n_reset} resultado(s) reales reiniciados para recalcular.", file=sys.stderr)
 
     pending = read_pending_predictions(engine)
     if pending.empty:
@@ -161,7 +216,7 @@ def main(argv: list[str] | None = None) -> int:
     still_pending = len(pending) - n
     print(
         f"[track_predictions] {n} predicción(es) resuelta(s) con el cierre real. "
-        f"Quedan {still_pending} pendientes (esperando a que daily_prices tenga su fecha).",
+        f"Quedan {still_pending} pendientes (sesión aún sin cerrar o sin datos en daily_prices).",
         file=sys.stderr,
     )
     return 0

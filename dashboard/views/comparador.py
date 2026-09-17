@@ -39,11 +39,12 @@ import streamlit as st
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import data_access as da  # noqa: E402
+import ui  # noqa: E402
 
 engine = da.get_engine()
 
-_COLOR_A = "#1D4ED8"  # azul — paleta de ui.py
-_COLOR_B = "#0B0F19"  # negro — paleta de ui.py (más contraste que el azul marino junto al azul principal)
+# Colores de las dos series: acento del tema y color secundario (ver
+# ui.PALETTES) — verde azulado y tinta en modo claro, ámbar y cian en terminal.
 
 
 @st.cache_data(ttl=300)
@@ -110,7 +111,7 @@ def _render_price_chart(df_a: pd.DataFrame, ticker_a: str, df_b: pd.DataFrame, t
             y=_normalize_to_100(df_a),
             mode="lines",
             name=ticker_a,
-            line=dict(color=_COLOR_A, width=1.5),
+            line=dict(color=ui.pal()["accent"], width=2),
         )
     )
     fig.add_trace(
@@ -119,20 +120,13 @@ def _render_price_chart(df_a: pd.DataFrame, ticker_a: str, df_b: pd.DataFrame, t
             y=_normalize_to_100(df_b),
             mode="lines",
             name=ticker_b,
-            line=dict(color=_COLOR_B, width=1.5),
+            line=dict(color=ui.pal()["second"], width=2),
         )
     )
-    fig.update_layout(
-        height=500,
-        margin=dict(l=10, r=10, t=30, b=10),
-        yaxis_title="Evolución normalizada (base 100 al inicio de la ventana)",
-        xaxis_title=None,
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
-        plot_bgcolor="#FFFFFF",
-        paper_bgcolor="#FFFFFF",
-    )
-    with st.container(border=True):
-        st.plotly_chart(fig, width="stretch")
+    fig.add_hline(y=100, line=dict(color=ui.pal()["muted"], width=1, dash="dot"))
+    ui.style_fig(fig, height=500, yaxis_title="Evolución normalizada (base 100 al inicio de la ventana)", xaxis_title=None)
+    with ui.card("comparador"):
+        ui.plotly_chart(fig)
 
 
 def _render_technical_panel(df_a: pd.DataFrame, ticker_a: str, df_b: pd.DataFrame, ticker_b: str) -> None:

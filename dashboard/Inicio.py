@@ -63,6 +63,9 @@ calibración (curva de fiabilidad + Brier score sobre el test real) que
 responde directamente al feedback de no vender `predicted_probability`
 como "confianza" sin comprobarlo. También gana selector de horizonte
 (antes solo mostraba el horizonte día).
+
+REVISIÓN DE AUDITORÍA 2026-09-16: aviso legal común a todas las páginas
+(`ui.render_disclaimer`, hallazgo U1).
 """
 
 from __future__ import annotations
@@ -91,4 +94,8 @@ pages = [
     st.Page("views/premium.py", title="Contenido Premium", icon="🔒"),
 ]
 pg = st.navigation(pages, position="top")
+# Aviso legal antes del contenido (auditoría, U1): muchas páginas terminan
+# con st.stop(), así que un aviso colocado después de pg.run() no llegaría a
+# pintarse en esos casos.
+ui.render_disclaimer()
 pg.run()

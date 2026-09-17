@@ -55,18 +55,41 @@ cp .env.example .env         # y rellena ALPHA_VANTAGE_API_KEY (solo necesaria p
 
 ## Ejecutar el pipeline
 
+> **Revisión de auditoría (16/09/2026).** Esta copia incluye las
+> correcciones de la auditoría: base de datos reparable, sin precios de
+> media sesión, splits y dividendos, predicciones de los tres horizontes y
+> más. Qué cambió y qué hay que ejecutar una vez está en
+> [`CAMBIOS_AUDITORIA.md`](CAMBIOS_AUDITORIA.md).
+
+Carga inicial (una vez):
+
 ```bash
-python src/download.py          # histórico OHLCV de los 208 tickers -> data/raw/
+python src/download.py          # histórico OHLCV de los tickers -> data/raw/
 python src/enrich_stocks.py     # nombre/sector/país -> stocks
 python src/load.py              # data/raw/ -> daily_prices
 python src/gold.py              # daily_prices -> gold_train / gold_inference
-python src/model.py             # entrena y evalúa -> models/*.joblib
-python src/predict.py           # gold_inference -> predictions
-python src/news.py              # noticias/sentimiento (modo automático, ver más abajo)
+python src/model.py --horizon 1 # entrena y evalúa (repetir con --horizon 5 y 20)
 ```
 
-Cada script trata los tickers de forma aislada: un fallo en uno no aborta
-el resto del lote (ver `src/README.md` para el detalle de cada módulo).
+Uso diario — un único comando, **después del cierre de EE. UU. (22:30 en
+Madrid)**:
+
+```bash
+python src/run_pipeline.py      # descarga, carga, gold, predicciones (1/5/20), resolución y noticias
+```
+
+Mantenimiento:
+
+```bash
+python src/maintenance.py check     # integridad de stocker.db
+python src/maintenance.py repair    # copia de seguridad + reconstrucción de gold_*
+python src/load.py --refresh APH    # re-descarga el histórico completo de un ticker
+python src/backtest_walkforward.py  # evaluación año a año frente a los baselines
+python -m pytest tests -q           # pruebas de las correcciones
+```
+
+Cada script trata los tickers de forma aislada: un fallo en uno no aborta el
+resto del lote (ver `src/README.md` para el detalle de cada módulo).
 
 ### Noticias y sentimiento en piloto automático
 

@@ -58,6 +58,10 @@ except ImportError:
 #   One (fusión completada el 18-19/05/2025); la acción dejó de cotizar.
 # - "HES" eliminado: Hess Corporation, adquirida por Chevron (fusión
 #   completada el 18/07/2025); la acción dejó de cotizar.
+# - "EA" eliminado (auditoría 16/09/2026, A2): Electronic Arts dejó de
+#   cotizar en NASDAQ el 04/08/2026 tras su compra por PIF, Silver Lake y
+#   Affinity Partners. yfinance no devolvía datos desde entonces y se seguía
+#   emitiendo una predicción diaria con features del 10/08.
 TICKERS = [
     "NVDA", "AAPL", "MSFT", "AMZN", "GOOGL", "GOOG", "AVGO", "META", "TSLA", "LLY",
     "BRK-B", "MU", "JPM", "WMT", "AMD", "V", "JNJ", "XOM", "MA", "ABBV",
@@ -75,7 +79,7 @@ TICKERS = [
     "MET", "SLB", "SPG", "AZO", "CARR", "COR", "PSX", "ADSK", "O", "TRGP",
     "HCA", "AME", "TGT", "ALL", "KMI", "OXY", "VMC", "FAST", "CTAS", "CMI",
     "LEN", "PRU", "DLR", "MPC", "KR", "HUM", "TEL", "BNY", "PAYX", "ODFL",
-    "GPN", "ROST", "OTIS", "PPG", "DAL", "VRSK", "ED", "WEC", "EA", "YUM",
+    "GPN", "ROST", "OTIS", "PPG", "DAL", "VRSK", "ED", "WEC", "YUM",
     "CPRT", "DHI", "PCG", "FDX", "AMP", "GLW", "CSX", "PEG", "IDXX",
     "ITW", "BDX", "DTE", "KHC", "IQV", "SBAC", "EXR", "AWK", "TRP", "EBAY",
     "LHX", "AEE", "WTW", "SYY", "MTB", "FSLR", "TROW", "CBRE", "ROK", "SRE",
@@ -137,6 +141,27 @@ DB_URL = f"sqlite:///{DB_PATH}"
 # NYSE-NASDAQ) de fallos reales de descarga. Ver pandas_market_calendars.
 MARKET_CALENDAR = "NYSE"
 
+# Minutos de margen tras el cierre oficial antes de considerar definitivo el
+# cierre de una sesión (auditoría, C2). yfinance tarda unos minutos en
+# consolidar el precio y el volumen finales. Ver src/market_time.py.
+MARKET_CLOSE_BUFFER_MINUTES = 20
+
+# --- Datos corporativos: splits y dividendos (auditoría, C3) ---
+# `download.py --daily` solo trae los últimos días, pero yfinance reajusta
+# TODO el histórico tras un split (Close) o un dividendo (Adj Close). Si al
+# cargar se detecta un split/dividendo en la ventana, o si las fechas que se
+# solapan con lo ya guardado difieren más de esta tolerancia relativa, se
+# vuelve a descargar y a sustituir el histórico completo de ese ticker
+# (`load.refresh_full_history`). Caso real: el split 2x1 de Amphenol (APH)
+# dejó en daily_prices una caída falsa del -49 % el 26/08/2026.
+CORPORATE_ACTION_TOLERANCE = 0.0005
+
+# Un ticker cuya última fecha en daily_prices tenga más de estos días
+# naturales de retraso respecto al más reciente del universo se considera
+# obsoleto (auditoría, A2): no se predice y el dashboard lo oculta de los
+# selectores. Cubre deslistados y descargas que fallan repetidamente.
+STALE_TICKER_DAYS = 7
+
 # --- Capa gold (features / target) ---
 # Nº mínimo de sesiones de histórico que debe tener un ticker en
 # daily_prices para poder construir aunque sea una fila de gold_train.
@@ -175,6 +200,24 @@ MODELS_DIR = Path(os.environ["STOCKER_MODELS_DIR"]) if os.environ.get("STOCKER_M
 # las etiquetas del selector en el dashboard.
 PREDICTION_HORIZONS = {1: "dia", 5: "semana", 20: "mes"}
 DEFAULT_PREDICTION_HORIZON = 1
+
+# ¿Usar las features de sentimiento de noticias en el modelo? (auditoría,
+# A3). Desactivado: la investigación de CONTEXTO.md no encontró señal, en
+# los ~9,5 años de entrenamiento valen 0 casi siempre (las noticias solo
+# cubren desde febrero de 2026) y en inferencia la cobertura diaria era de
+# ~20 tickers de 208, así que el modelo veía "neutro" donde en realidad no
+# había datos. Las columnas se siguen calculando en gold_*; solo cambia qué
+# columnas recibe el modelo. Los modelos ya entrenados guardan su propia
+# lista (`feature_names`) y siguen funcionando igual.
+MODEL_USE_NEWS_FEATURES = False
+
+# Tamaño de la muestra del test usada para la importancia por permutación
+# (auditoría, M2). La importancia MDI de Random Forest favorece variables
+# continuas; la permutación mide cuánto empeora el acierto en el test al
+# desordenar cada variable. 50.000 filas x 3 repeticiones mantiene el coste
+# en unos minutos.
+PERMUTATION_IMPORTANCE_SAMPLE = 50_000
+PERMUTATION_IMPORTANCE_REPEATS = 3
 
 # --- Noticias y sentimiento (Alpha Vantage) ---
 # Fuente NUEVA respecto al resto del pipeline (yfinance cubre solo precios).
@@ -294,6 +337,14 @@ NEWS_PRIORITY_TICKERS = TICKERS[:NEWS_PRIORITY_TICKERS_COUNT]
 # pidió explícitamente priorizar relevancia sobre cobertura uniforme.
 NEWS_PRIORITY_DAILY_SHARE = 0.8
 
+# Ventana máxima (días) por llamada en la actualización diaria (auditoría,
+# A3). Cada ticker se pide desde su última fecha consultada hasta hoy, pero
+# si lleva mucho sin consultarse se limita a esta ventana para no chocar
+# con el máximo de 1.000 artículos por llamada de Alpha Vantage. Con 25
+# llamadas/día y un 80 % para los prioritarios, los 157 tickers restantes
+# se consultan cada ~32 días: 35 días cubre esa vuelta sin huecos.
+NEWS_DAILY_MAX_WINDOW_DAYS = 35
+
 NEWS_RAW_DIR = DATA_DIR / "raw" / "news"
 
 # --- Logos de empresa (2026-08-28) ---
@@ -357,3 +408,24 @@ PREMIUM_CHAT_MODEL = "claude-haiku-4-5-20251001"
 # Contenido Premium es pública sin autenticación todavía.
 PREMIUM_CHAT_MAX_PER_SESSION = 10
 PREMIUM_CHAT_MAX_PER_DAY_GLOBAL = 150
+
+# Límite diario por dirección IP (auditoría, A5): el límite por sesión se
+# salta recargando la página. Streamlit expone la IP del visitante en
+# `st.context.ip_address` cuando la app está desplegada; en local vale None
+# y solo aplican los otros dos límites.
+PREMIUM_CHAT_MAX_PER_DAY_PER_IP = 20
+
+# Documentos que NO entran en el contexto del chat (auditoría, A5). Los
+# 10-Q completos pesan cientos de KB (el de META, 460 KB) y llevaban el
+# corpus de META a ~150-190 mil tokens, cerca del límite de contexto de
+# Haiku 4.5 antes incluso del historial. El comunicado, la transcripción
+# y el análisis ya cubren lo que se pregunta en la práctica.
+PREMIUM_CHAT_EXCLUDE_PATTERNS = ["10q_"]
+
+# Tope de tamaño del corpus en caracteres (~4 caracteres por token). Si se
+# supera, se descartan primero los documentos oficiales más grandes; el
+# análisis redactado se conserva siempre.
+PREMIUM_CHAT_MAX_CORPUS_CHARS = 400_000
+
+# Mensajes del historial que se envían en cada pregunta (los más recientes).
+PREMIUM_CHAT_MAX_HISTORY_MESSAGES = 10

@@ -113,6 +113,22 @@ ser su propia fila a todo el ancho, debajo de las dos columnas
 (gráfico | noticias), en vez de apilada dentro de la columna estrecha —
 reparte mejor el alto total de la página y vuelve a caber sin scroll.
 
+REDISEÑO 2026-09-17 (modo claro "Fintech limpia", modo oscuro "Terminal
+financiera", ver dashboard/ui.py): fila principal con precio + gráfico a la
+izquierda y la predicción y el sentimiento de mercado en tarjetas a la
+derecha; noticias y lectura rápida debajo. En modo terminal el gráfico usa
+velas japonesas y aparece una cinta de cotizaciones. Los colores salen de
+`ui.pal()`, nunca fijos en esta página.
+
+REVISIÓN DE AUDITORÍA 2026-09-16:
+- A4: aviso de fecha de los datos y de la última actualización del pipeline.
+- A1/M4: la tarjeta de predicción dice cuándo se hizo y con qué modelo, y
+  avisa si no es el modelo que la página usa para el backtest.
+- A3: el medidor de sentimiento indica cuántas acciones cubre de verdad.
+- U2: los aciertos y fallos del periodo de ENTRENAMIENTO se pintan
+  atenuados; solo los del examen real (test) van en verde/rojo.
+- U4: los titulares enlazan al artículo original.
+
 Vive en views/, no pages/ — ver la nota en views/inicio.py sobre por qué.
 """
 
@@ -123,23 +139,18 @@ import sys
 from pathlib import Path
 
 import pandas as pd
-import plotly.graph_objects as go
 import streamlit as st
 from streamlit_echarts import st_echarts
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import data_access as da  # noqa: E402
+import ui  # noqa: E402
 
 engine = da.get_engine()
 
 HORIZON_LABELS = {1: "Día (mañana)", 5: "Semana (~5 sesiones)", 20: "Mes (~20 sesiones)"}
 _LABEL_TO_HORIZON = {v: k for k, v in HORIZON_LABELS.items()}
 
-_SENTIMENT_COLOR = {
-    "Bearish": "#d62728", "Somewhat-Bearish": "#e79a97",
-    "Neutral": "#9CA3AF",
-    "Somewhat-Bullish": "#86c98a", "Bullish": "#2ca02c",
-}
 
 
 @st.cache_data(ttl=300)
@@ -153,8 +164,15 @@ def _tickers_by_sector():
 
 
 @st.cache_resource
-def _model_bundle(horizon: int):
+def _model_bundle(horizon: int, model_version: str):
+    # model_version solo forma parte de la clave de caché: al reentrenar,
+    # cambia y se carga el modelo nuevo sin reiniciar la app (auditoría, M4).
     return da.load_latest_model(horizon=horizon)
+
+
+@st.cache_data(ttl=300)
+def _latest_data_date():
+    return da.get_latest_data_date(engine)
 
 
 @st.cache_data(ttl=300)
@@ -178,6 +196,11 @@ def _recent_articles(ticker: str):
 @st.cache_data(ttl=300)
 def _market_sentiment_gauge():
     return da.get_market_sentiment_gauge(engine)
+
+
+@st.cache_data(ttl=300)
+def _ticker_tape():
+    return da.get_ticker_tape(engine)
 
 
 @st.cache_data(ttl=300)
@@ -217,23 +240,32 @@ target_col = "target_up_down" if horizon == 1 else f"target_up_down_{horizon}d"
 meta = da.get_ticker_metadata(engine, ticker)
 logo_url = da.ticker_logo_url(ticker)
 
+p = ui.pal()
+terminal = ui.is_terminal()
+
+# Cinta de cotizaciones (solo modo terminal, rediseño 2026-09-17).
+ui.render_ticker_tape(_ticker_tape())
+
 _logo_html = (
-    f'<img src="{logo_url}" width="26" height="26" '
-    'style="border-radius:6px; vertical-align:middle; margin-right:8px;">'
+    f'<img src="{logo_url}" width="30" height="30" '
+    'style="border-radius:8px; vertical-align:middle; margin-right:10px;">'
 ) if logo_url else ""
 _nombre_empresa = html.escape(meta.get("nombre") or ticker)
-st.markdown(
-    f'<div style="margin-top:4px;">{_logo_html}'
-    f'<span style="color:#9CA3AF; font-size:1.05rem; vertical-align:middle;">'
-    f'{_nombre_empresa} · <strong>#{ticker}</strong></span></div>',
-    unsafe_allow_html=True,
-)
-st.caption(f"{meta.get('sector') or 'sector desconocido'} · {meta.get('pais') or 'país desconocido'}")
+col_head, col_fresh = st.columns([3, 2], vertical_alignment="bottom")
+with col_head:
+    st.markdown(
+        f'<div style="display:flex; align-items:center; gap:2px;">{_logo_html}'
+        f'<span style="font-size:1.35rem; font-weight:{500 if terminal else 700}; letter-spacing:{"0.02em" if terminal else "-0.02em"};">'
+        f'{"#" + ticker if terminal else _nombre_empresa}</span>'
+        f'<span style="color:{p["muted"]}; margin-left:10px;">{_nombre_empresa if terminal else "#" + ticker}</span></div>',
+        unsafe_allow_html=True,
+    )
+    st.caption(f"{meta.get('sector') or 'sector desconocido'} · {meta.get('pais') or 'país desconocido'}")
+with col_fresh:
+    ui.render_data_freshness(_latest_data_date(), da.get_pipeline_status())
 
-try:
-    bundle = _model_bundle(horizon)
-except FileNotFoundError:
-    bundle = None
+_version = da.latest_model_version(horizon)
+bundle = _model_bundle(horizon, _version) if _version else None
 
 if bundle is None:
     st.info(
@@ -261,48 +293,106 @@ last_close = float(prices["close"].iloc[-1])
 prev_close = float(prices["close"].iloc[-2]) if len(prices) >= 2 else None
 var_pct = (last_close / prev_close - 1) if prev_close else None
 
-# --- KPIs de cabecera (recentrados en la acción elegida) + sentimiento
-# de mercado (agregado, no depende del ticker — va aquí, como una
-# tarjeta más de contexto, en vez de una sección propia a todo lo ancho,
-# ver docstring del módulo) ---
-with st.container(border=True):
-    col1, col2, col3, col4 = st.columns([1, 1, 1, 1.3])
-    if latest_pred and latest_pred["predicted_target_up_down"] is not None:
-        direccion = "📈 Sube" if latest_pred["predicted_target_up_down"] == 1 else "📉 Baja"
-        col1.metric(f"Predicción · {latest_pred['date_predicha']}", direccion)
-        # Bug corregido 2026-09-09 (ver CONTEXTO.md "Probabilidad
-        # mostrada para la dirección equivocada"): `predicted_probability`
-        # guarda SIEMPRE P(sube), no la probabilidad de la dirección
-        # predicha — `da.prediction_confidence()` ya lo ajusta.
-        # (2026-09-10: se probó además marcar como "poco concluyente" la
-        # dirección cuando la confianza cae por debajo del 55%, ver
-        # CONTEXTO.md "Feedback de un tutor: comunicación de predicciones
-        # poco concluyentes..." — el usuario pidió revertirlo, así que
-        # "Sube"/"Baja" se muestra siempre, sin ese aviso.)
-        confianza = da.prediction_confidence(
-            latest_pred["predicted_target_up_down"], latest_pred["predicted_probability"]
-        )
-        col2.metric(
-            "Probabilidad estimada", f"{confianza:.1%}",
-            help=(
-                "Probabilidad que el modelo asigna a ESTA dirección concreta. Salida cruda de Random "
-                "Forest, sin garantía de estar calibrada como confianza real (ver calibración en "
-                "'¿Funciona de verdad?')."
-            ),
-        )
+# --- Backtest del modelo sobre la ventana (aciertos/fallos) ---
+test_date_min = bundle.get("test_date_min")
+gold_eval = pd.DataFrame()
+gold_train_period = pd.DataFrame()
+test_cutoff = None
+if not gold.empty:
+    gold = gold.copy()
+    gold["pred"] = da.predict_for_gold_rows(bundle, gold)
+    gold["acierto"] = gold["pred"] == gold[target_col]
+    if test_date_min:
+        test_cutoff = pd.Timestamp(test_date_min)
+        gold_eval = gold[gold["date"] >= test_cutoff]
+        # Periodo de entrenamiento atenuado (auditoría, U2): el modelo ya vio
+        # esas fechas, así que sus "aciertos" no cuentan como examen.
+        gold_train_period = gold[gold["date"] < test_cutoff]
     else:
-        col1.metric("Predicción", "—")
-        col2.metric("Probabilidad estimada", "—")
-    col3.metric(
-        "Último cierre",
-        f"${last_close:,.2f}",
-        delta=f"{var_pct:+.2%}" if var_pct is not None else None,
-    )
-    with col4:
+        gold_eval = gold
+
+# --- Fila principal: precio + gráfico (izquierda) | predicción (derecha) ---
+col_main, col_pred = st.columns([2.2, 1])
+
+with col_main:
+    with ui.card("precio"):
+        c_price, c_rest = st.columns([1.2, 2], vertical_alignment="bottom")
+        c_price.metric(
+            "Último cierre",
+            f"${last_close:,.2f}",
+            delta=f"{var_pct:+.2%}" if var_pct is not None else None,
+        )
+        c_rest.caption(
+            f"Cierre del {prices['date'].iloc[-1]:%d/%m/%Y} · últimos {meses} meses · "
+            + ("velas diarias" if terminal else "precio de cierre")
+        )
+        fig = ui.price_chart(
+            prices, gold_eval=gold_eval, gold_train_period=gold_train_period,
+            test_cutoff=test_cutoff, prediction=latest_pred, height=330,
+        )
+        ui.plotly_chart(fig)
+        if n_sin_target:
+            st.caption(
+                f"ℹ️ Las últimas {n_sin_target} sesiones todavía no tienen las {horizon} sesiones futuras "
+                "necesarias para saber si acertaron."
+            )
+
+with col_pred:
+    with ui.card("prediccion"):
+        st.markdown("**Señal del modelo**" if terminal else "**¿Qué espera el modelo?**")
+        if latest_pred and latest_pred["predicted_target_up_down"] is not None:
+            sube = latest_pred["predicted_target_up_down"] == 1
+            direccion = ("▲ SUBE" if sube else "▼ BAJA") if terminal else ("▲ Sube" if sube else "▼ Baja")
+            st.metric(
+                f"Predicción · {latest_pred['date_predicha']}", direccion,
+                help=(
+                    f"Hecha el {str(latest_pred['predicted_at'])[:16]} con el modelo "
+                    f"`{latest_pred['model_version']}`."
+                ),
+            )
+            # Bug corregido 2026-09-09 (ver CONTEXTO.md "Probabilidad
+            # mostrada para la dirección equivocada"): `predicted_probability`
+            # guarda SIEMPRE P(sube) — `da.prediction_confidence()` lo ajusta.
+            # (2026-09-10: el aviso de "poco concluyente" se revirtió a
+            # petición del usuario; aquí tampoco se añade.)
+            confianza = da.prediction_confidence(
+                latest_pred["predicted_target_up_down"], latest_pred["predicted_probability"]
+            )
+            p_up = float(latest_pred["predicted_probability"])
+            st.metric(
+                "Probabilidad estimada", f"{confianza:.1%}",
+                help=(
+                    "Probabilidad que el modelo asigna a ESTA dirección concreta. Salida cruda de Random "
+                    "Forest, sin garantía de estar calibrada como confianza real (ver calibración en "
+                    "'¿Funciona de verdad?')."
+                ),
+            )
+            # Barra de P(sube) con el 50 % marcado en el centro.
+            st.markdown(
+                f"""<div class="stk-num" style="margin-top:-4px;">
+                <div style="position:relative; height:8px; border-radius:{0 if terminal else 999}px;
+                            background:{p['line']}; overflow:hidden;">
+                  <div style="position:absolute; left:0; top:0; bottom:0; width:{p_up*100:.1f}%;
+                              background:{p['up'] if sube else p['down']};"></div>
+                </div>
+                <div style="position:relative; height:0;">
+                  <div style="position:absolute; left:50%; top:-12px; width:1px; height:16px; background:{p['ink']};"></div>
+                </div>
+                <div style="display:flex; justify-content:space-between; font-size:11.5px; color:{p['muted']}; margin-top:6px;">
+                  <span>baja</span><span>50 %</span><span>sube</span>
+                </div></div>""",
+                unsafe_allow_html=True,
+            )
+        else:
+            st.metric("Predicción", "—")
+            st.caption("Todavía no hay una predicción guardada en este horizonte.")
+
+    with ui.card("sentimiento"):
         market_gauge = _market_sentiment_gauge()
         if market_gauge:
             valor = round(float(market_gauge["sentimiento"]), 2)
             gauge_option = {
+                "backgroundColor": "transparent",
                 "series": [{
                     "type": "gauge",
                     "startAngle": 180,
@@ -315,203 +405,133 @@ with st.container(border=True):
                     "splitNumber": 4,
                     "axisLine": {
                         "lineStyle": {
-                            "width": 10,
+                            "width": 8 if terminal else 10,
                             "color": [
-                                [0.325, "#f6cdc9"],
-                                [0.425, "#fbe4e1"],
-                                [0.575, "#EEF0F2"],
-                                [0.675, "#ddeedd"],
-                                [1, "#c3e6c3"],
+                                [0.325, p["down"]],
+                                [0.425, p["down"] + "80"],
+                                [0.575, p["line"]],
+                                [0.675, p["up"] + "80"],
+                                [1, p["up"]],
                             ],
                         }
                     },
-                    "pointer": {
-                        "length": "58%",
-                        "width": 4,
-                        "itemStyle": {"color": "#1D4ED8"},
-                    },
+                    "pointer": {"length": "58%", "width": 3 if terminal else 4, "itemStyle": {"color": p["accent"]}},
                     "anchor": {
-                        "show": True,
-                        "showAbove": True,
-                        "size": 7,
-                        "itemStyle": {"color": "#1D4ED8", "borderColor": "#1D4ED8", "borderWidth": 1},
+                        "show": True, "showAbove": True, "size": 7,
+                        "itemStyle": {"color": p["accent"], "borderColor": p["accent"], "borderWidth": 1},
                     },
                     "axisTick": {"show": False},
-                    "splitLine": {
-                        "length": 7,
-                        "distance": -10,
-                        "lineStyle": {"color": "#9CA3AF", "width": 1},
-                    },
-                    "axisLabel": {"color": "#9CA3AF", "fontSize": 8, "distance": -18},
+                    "splitLine": {"length": 6, "distance": -9, "lineStyle": {"color": p["muted"], "width": 1}},
+                    "axisLabel": {"color": p["muted"], "fontSize": 8, "distance": -18},
                     "title": {"show": False},
-                    "detail": {
-                        "valueAnimation": True,
-                        "fontSize": 18,
-                        "fontWeight": 600,
-                        "color": "#0B0F19",
-                        "offsetCenter": [0, "-15%"],
-                        "formatter": "{value}",
-                    },
+                    # Sin número dentro del medidor (se solapaba con la aguja):
+                    # el valor va en el texto de debajo.
+                    "detail": {"show": False},
                     "data": [{"value": valor}],
-                }]
+                }],
             }
-            st_echarts(options=gauge_option, height="110px")
-            # Alcance/ventana explícitos en el propio texto (2026-09-10,
-            # feedback de un tutor: dos cifras de nº de artículos en la
-            # misma página sin explicar por qué difieren — ver
-            # CONTEXTO.md "Feedback de un tutor: comunicación de
-            # predicciones poco concluyentes, trazabilidad y consistencia
-            # del sentimiento"). Este número es de TODO el universo
-            # (208 tickers) en los últimos `n_dias` días naturales — muy
-            # distinto del de "Lectura rápida" más abajo, que es de UN
-            # solo ticker en el último mes. Antes ninguno de los dos
-            # decía su alcance, así que parecían inconsistentes entre sí
-            # sin serlo (miden cosas distintas a propósito).
+            st_echarts(options=gauge_option, height="105px", key=f"gauge_{ui.mode()}")
+            # Alcance/ventana explícitos (2026-09-10, feedback de un tutor):
+            # esta cifra es del universo completo, no de la acción elegida.
             st.caption(
-                f"Sentimiento de mercado (todo el universo, últimos {market_gauge['n_dias']} días): "
-                f"**{market_gauge['label']}** ({market_gauge['n_articles']} art.)"
+                f"Sentimiento de mercado (últimos {market_gauge['n_dias']} días): "
+                f"**{market_gauge['label']} ({valor:+.2f})** · {market_gauge['n_articles']} art. de "
+                f"{market_gauge['n_tickers']} de {market_gauge['n_tickers_total']} acciones"
             )
         else:
             st.caption("Sentimiento de mercado: sin datos todavía.")
 
-# --- Fila principal: gráfico (izquierda) + noticias/lectura rápida (derecha) ---
-col_chart, col_side = st.columns([2, 1])
+# --- Segunda fila: noticias | lectura rápida ---
+col_news, col_read = st.columns([1.3, 1])
 
-with col_chart:
-    fig = go.Figure()
-    fig.add_trace(
-        go.Scatter(
-            x=prices["date"], y=prices["close"], mode="lines", name="Cierre real",
-            line=dict(color="#1D4ED8", width=1.5),
-        )
-    )
-
-    test_date_min = bundle.get("test_date_min")
-    gold_eval = pd.DataFrame()
-    if not gold.empty:
-        gold = gold.copy()
-        gold["pred"] = da.predict_for_gold_rows(bundle, gold)
-        gold["acierto"] = gold["pred"] == gold[target_col]
-
-        if test_date_min:
-            test_cutoff = pd.Timestamp(test_date_min)
-            fig.add_vline(
-                x=test_cutoff, line_dash="dot", line_color="gray",
-                annotation_text="examen real →", annotation_position="top",
-            )
-            gold_eval = gold[gold["date"] >= test_cutoff]
-
-        aciertos = gold[gold["acierto"]]
-        fallos = gold[~gold["acierto"]]
-        fig.add_trace(go.Scatter(
-            x=aciertos["date"], y=aciertos["close"], mode="markers", name="Acertó",
-            marker=dict(color="#2ca02c", size=6, symbol="circle"),
-        ))
-        fig.add_trace(go.Scatter(
-            x=fallos["date"], y=fallos["close"], mode="markers", name="Falló",
-            marker=dict(color="#d62728", size=6, symbol="x"),
-        ))
-
-    if latest_pred and latest_pred["predicted_target_up_down"] is not None:
-        direccion = "SUBE" if latest_pred["predicted_target_up_down"] == 1 else "BAJA"
-        color = "#2ca02c" if latest_pred["predicted_target_up_down"] == 1 else "#d62728"
-        fig.add_trace(go.Scatter(
-            x=[pd.Timestamp(latest_pred["date_predicha"])], y=[last_close], mode="markers+text",
-            name=f"Predicción {latest_pred['date_predicha']}",
-            marker=dict(color=color, size=14, symbol="star"), text=[direccion], textposition="top center",
-        ))
-
-    fig.update_layout(
-        height=300, margin=dict(l=10, r=10, t=25, b=10),
-        yaxis_title="Precio de cierre (USD)", xaxis_title=None,
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0, font=dict(size=10)),
-        plot_bgcolor="#FFFFFF", paper_bgcolor="#FFFFFF",
-    )
-    with st.container(border=True):
-        st.plotly_chart(fig, width="stretch")
-    if n_sin_target:
-        st.caption(
-            f"ℹ️ Las últimas {n_sin_target} sesiones todavía no tienen las {horizon} sesiones futuras "
-            "necesarias para saber si acertaron."
-        )
-
-with col_side:
-    st.markdown(f"**Últimas noticias de {ticker}**")
-    articulos = _recent_articles(ticker)
-    with st.container(border=True, height=200):
+with col_news:
+    with ui.card("noticias"):
+        st.markdown(f"**Últimas noticias de {ticker}**")
+        articulos = _recent_articles(ticker)
         if articulos.empty:
             st.caption(f"🕒 Todavía no hay noticias guardadas de {ticker} (relevancia ≥ 0.5).")
         else:
             items_html = []
-            for _, row in articulos.iterrows():
+            for i, (_, row) in enumerate(articulos.iterrows()):
                 label = row["ticker_sentiment_label"]
-                color = _SENTIMENT_COLOR.get(label, "#9CA3AF")
+                color = ui.sentiment_color(label)
                 label_es = da.SENTIMENT_LABEL_ES.get(label, label)
-                titulo = html.escape(str(row["title"]))
-                if len(titulo) > 60:
-                    titulo = titulo[:58] + "…"
+                titulo_plano = str(row["title"])
+                if len(titulo_plano) > 90:
+                    titulo_plano = titulo_plano[:88] + "…"
+                titulo = html.escape(titulo_plano)
+                url = str(row.get("url") or "")
+                if url.startswith(("https://", "http://")):
+                    titulo = (
+                        f'<a href="{html.escape(url, quote=True)}" target="_blank" '
+                        f'rel="noopener noreferrer">{titulo} ↗</a>'
+                    )
                 fuente = html.escape(str(row["source"] or "fuente desconocida"))
+                borde = "" if i == 0 else f"border-top:1px solid {p['line']};"
+                if terminal:
+                    chip = (
+                        f'<span style="border:1px solid {color}; color:{color}; padding:0 5px; '
+                        f'font-size:10px;">{html.escape(label_es.upper())}</span>'
+                    )
+                else:
+                    chip = (
+                        f'<span style="display:inline-block; width:8px; height:8px; border-radius:50%; '
+                        f'background:{color}; margin-right:4px;"></span>{html.escape(label_es)}'
+                    )
                 items_html.append(
-                    f"""<div style="padding:5px 0; border-bottom:1px solid #EEF0F2;">
-                        <div style="font-size:12.5px; color:#0B0F19; line-height:1.3;">{titulo}</div>
-                        <div style="font-size:10.5px; color:#9CA3AF; margin-top:2px;">
-                            {fuente} · {row['date']} ·
-                            <span style="background:{color}22; color:{color}; padding:1px 7px; border-radius:999px; font-weight:500;">{html.escape(label_es)}</span>
-                        </div>
+                    f"""<div style="padding:8px 0; {borde}">
+                        <div style="font-size:13.5px; line-height:1.35; font-weight:{400 if terminal else 600};">{titulo}</div>
+                        <div style="font-size:11.5px; color:{p['muted']}; margin-top:3px;">{fuente} · {row['date']} · {chip}</div>
                     </div>"""
                 )
-            st.markdown("".join(items_html), unsafe_allow_html=True)
+            st.markdown(f'<div class="stk-news">{"".join(items_html)}</div>', unsafe_allow_html=True)
 
-    if st.button("Ver todas las noticias →", width="stretch"):
-        st.session_state["noticias_ticker"] = ticker
-        st.switch_page("views/sentimiento_por_accion.py")
+        if st.button("Ver todas las noticias →", width="stretch"):
+            st.session_state["noticias_ticker"] = ticker
+            st.switch_page("views/sentimiento_por_accion.py")
 
-# --- Lectura rápida: a todo el ancho, debajo de las dos columnas (no
-# dentro de col_side) — ver docstring del módulo, "Lectura rápida a todo
-# el ancho". Al meter el botón "Ver todas las noticias →" en col_side,
-# esa columna quedó más alta que col_chart y reintrodujo scroll vertical
-# en 1920x1080; sacar este bloque a una fila propia de ancho completo
-# reparte mejor el alto total de la página.
-st.markdown("**Lectura rápida**")
-with st.container(border=True):
-    partes = []
-    if latest_pred and latest_pred["predicted_target_up_down"] is not None:
-        direccion_txt = "**subirá**" if latest_pred["predicted_target_up_down"] == 1 else "**bajará**"
-        # Mismo fix que en el KPI de arriba: confianza en la dirección
-        # predicha, no P(sube) en crudo. (2026-09-10: el aviso de "poco
-        # concluyente" que hubo aquí se revirtió a petición del usuario —
-        # ver CONTEXTO.md.)
-        confianza_txt = da.prediction_confidence(
-            latest_pred["predicted_target_up_down"], latest_pred["predicted_probability"]
+with col_read:
+    with ui.card("lectura"):
+        st.markdown("**Lectura rápida**")
+        partes = []
+        if latest_pred and latest_pred["predicted_target_up_down"] is not None:
+            direccion_txt = "**subirá**" if latest_pred["predicted_target_up_down"] == 1 else "**bajará**"
+            confianza_txt = da.prediction_confidence(
+                latest_pred["predicted_target_up_down"], latest_pred["predicted_probability"]
+            )
+            partes.append(
+                f"El modelo predice que **{ticker}** {direccion_txt} en el horizonte "
+                f"**{horizonte_label.lower()}**, con una probabilidad estimada del "
+                f"**{confianza_txt:.0%}**."
+            )
+        else:
+            partes.append(f"Todavía no hay una predicción guardada para **{ticker}** en este horizonte.")
+
+        daily_sent = _daily_sentiment(ticker)
+        if not daily_sent.empty:
+            n_art = int(daily_sent["n_articles"].sum())
+            tono = float((daily_sent["avg_sentiment_score"] * daily_sent["n_articles"]).sum() / n_art) if n_art else 0.0
+            tono_label = da.sentiment_scalar_label(tono)
+            # "de SOLO esta acción" explícito (2026-09-10): no comparable con
+            # la cifra de artículos de todo el universo del medidor.
+            partes.append(
+                f"Las noticias de **solo {ticker}** en el último mes tienen un tono **{tono_label.lower()}** "
+                f"({n_art} artículos de {ticker}, no de todo el mercado)."
+            )
+        else:
+            partes.append(f"Sin noticias recientes de {ticker} en el último mes.")
+
+        if not gold_eval.empty:
+            partes.append(
+                f"En el examen real, con {ticker} y en esta ventana, el modelo acertó "
+                f"**{gold_eval['acierto'].mean():.0%}** de {len(gold_eval)} sesiones."
+            )
+
+        st.markdown(" ".join(partes))
+        st.caption(
+            "Texto generado a partir de los mismos datos de arriba — el sentimiento de noticias es "
+            "informativo, sin evidencia de que ayude a predecir el precio (ver CONTEXTO.md)."
         )
-        partes.append(
-            f"El modelo predice que **{ticker}** {direccion_txt} en el horizonte "
-            f"**{horizonte_label.lower()}**, con una probabilidad estimada del "
-            f"**{confianza_txt:.0%}**."
-        )
-    else:
-        partes.append(f"Todavía no hay una predicción guardada para **{ticker}** en este horizonte.")
-
-    daily_sent = _daily_sentiment(ticker)
-    if not daily_sent.empty:
-        n_art = int(daily_sent["n_articles"].sum())
-        tono = float((daily_sent["avg_sentiment_score"] * daily_sent["n_articles"]).sum() / n_art) if n_art else 0.0
-        tono_label = da.sentiment_scalar_label(tono)
-        # "de SOLO esta acción" explícito (2026-09-10, ver comentario del
-        # caption de "Sentimiento de mercado" más arriba) — para que no
-        # se lea como comparable al nº de artículos de todo el universo.
-        partes.append(
-            f"Las noticias de **solo {ticker}** en el último mes tienen un tono **{tono_label.lower()}** "
-            f"({n_art} artículos de {ticker}, no de todo el mercado)."
-        )
-    else:
-        partes.append(f"Sin noticias recientes de {ticker} en el último mes.")
-
-    st.markdown(" ".join(partes))
-    st.caption(
-        "Texto generado a partir de los mismos datos de arriba — el sentimiento de noticias es "
-        "informativo, sin evidencia de que ayude a predecir el precio (ver CONTEXTO.md)."
-    )
 
 st.divider()
 # Pie de trazabilidad del pipeline (2026-09-10, feedback de un tutor:

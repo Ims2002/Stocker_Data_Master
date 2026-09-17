@@ -10,7 +10,8 @@ joblib
 numpy
 requests
 python-dotenv
-streamlit
+# >=1.50: temas [theme.light]/[theme.dark], fuentes por URL y st.context.theme (rediseño 2026-09-17)
+streamlit>=1.50
 plotly
 streamlit-echarts
 anthropic

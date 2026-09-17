@@ -1,28 +1,20 @@
 @echo off
-REM Lanza la cadena diaria de precios/modelo/seguimiento y guarda la salida
-REM en data\pipeline_cron.log. Pensado para programarse con el Task
-REM Scheduler de Windows (una vez al dia, antes o despues de
-REM run_news_daily.bat) - ver CONTEXTO.md / src/README.md para el detalle.
+REM Cadena diaria completa de Stocker (precios, gold, predicciones de los
+REM tres horizontes, resolucion de predicciones y noticias) en UN solo
+REM proceso con cerrojo - ver src\run_pipeline.py.
 REM
-REM Orden (cada paso es independiente y sigue aunque el anterior haya
-REM fallado para algunos tickers - ver docstrings de cada script):
-REM   1. download.py --daily  - descarga solo los ultimos dias (NO el
-REM                             historico completo de 10 anios - ver
-REM                             config.DOWNLOAD_DAILY_LOOKBACK_DAYS)
-REM   2. load.py              - upsert en daily_prices (dedupe automatico
-REM                             si hay solape con lo ya cargado)
-REM   3. gold.py              - recalcula gold_train/gold_inference
-REM   4. predict.py           - genera la prediccion de manana con el
-REM                             modelo mas reciente en models\
-REM   5. track_predictions.py - resuelve predicciones anteriores con el
-REM                             cierre real ya conocido en daily_prices
+REM PROGRAMACION RECOMENDADA (auditoria 16/09/2026):
+REM   - Una unica tarea diaria a las 22:30 hora de Madrid, de lunes a sabado.
+REM     La bolsa de EE. UU. cierra a las 22:00 (hora de Madrid); ejecutar
+REM     antes guarda precios de media sesion (hallazgo C2).
+REM   - Desactivar la tarea de run_news_daily.bat: las noticias ya van
+REM     incluidas al final de esta cadena. Si se mantiene, espera a que
+REM     termine el pipeline gracias al cerrojo, pero no hace falta.
+REM   - Los sabados se hace la recarga completa del historico (splits y
+REM     dividendos, hallazgo C3).
 REM
-REM PYTHONUTF8=1 evita el mojibake en el log (mismo motivo que
-REM run_news_daily.bat, ver CONTEXTO.md, 2026-07-31).
+REM PYTHONUTF8=1 evita el mojibake en el log (ver CONTEXTO.md, 2026-07-31).
 set PYTHONUTF8=1
 cd /d "%~dp0"
-python src\download.py --daily >> data\pipeline_cron.log 2>&1
-python src\load.py >> data\pipeline_cron.log 2>&1
-python src\gold.py >> data\pipeline_cron.log 2>&1
-python src\predict.py >> data\pipeline_cron.log 2>&1
-python src\track_predictions.py >> data\pipeline_cron.log 2>&1
+python src\run_pipeline.py >> data\pipeline_cron.log 2>&1
+exit /b %ERRORLEVEL%

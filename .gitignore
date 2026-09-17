@@ -85,3 +85,15 @@ desktop.ini
 # Se mantiene local para referencia propia, no se publica: es contenido
 # duplicado, no aporta nada que no esté ya en su sitio en el repo.
 /context/
+
+# --- Revisión de auditoría (2026-09-16) ---
+# Copias de seguridad de src/maintenance.py, informes de
+# src/backtest_walkforward.py, cerrojo y estado de src/run_pipeline.py y
+# ficheros auxiliares del modo WAL de SQLite.
+data/backups/
+data/reports/
+data/.pipeline.lock
+data/pipeline_status.json
+*.db-wal
+*.db-shm
+dashboard/.premium_chat_usage.tmp

@@ -28,6 +28,7 @@ import streamlit as st
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import data_access as da  # noqa: E402
+import ui  # noqa: E402
 
 engine = da.get_engine()
 
@@ -48,19 +49,20 @@ horizon = _LABEL_TO_HORIZON[horizonte_label] if horizonte_label else 1
 
 
 @st.cache_resource
-def _model_bundle(horizon: int):
+def _model_bundle(horizon: int, model_version: str):
+    # model_version solo forma parte de la clave de caché (auditoría, M4).
     return da.load_latest_model(horizon=horizon)
 
 
-try:
-    bundle = _model_bundle(horizon)
-except FileNotFoundError:
+_version = da.latest_model_version(horizon)
+if _version is None:
     st.info(
         f"Todavía no hay ningún modelo entrenado para el horizonte **{horizonte_label}** — ejecuta "
         f"`python src/model.py --horizon {horizon}`. Elige **Día (mañana)** mientras tanto.",
         icon="🚧",
     )
     st.stop()
+bundle = _model_bundle(horizon, _version)
 
 if "metrics_model" not in bundle:
     st.warning(
@@ -111,29 +113,45 @@ les gana, no está aportando nada de verdad.
     """
 )
 
+_persistencia_label = {
+    1: "Predecir que mañana repite a hoy",
+    5: "Predecir que la semana repite a la anterior",
+    20: "Predecir que el mes repite al anterior",
+}.get(horizon, "Persistencia")
+_base_cols = ("accuracy", "precision", "recall")
 rows = [
-    {"Método": f"Modelo ({bundle.get('model_type')})", **m_model},
-    {"Método": "Predecir siempre lo más frecuente", **m_majority},
-    {"Método": "Predecir que mañana repite a hoy", **m_persistence},
+    {"Método": f"Modelo ({bundle.get('model_type')})", **{k: m_model[k] for k in _base_cols}},
+    {"Método": "Predecir siempre lo más frecuente", **{k: m_majority[k] for k in _base_cols}},
+    {"Método": _persistencia_label, **{k: m_persistence[k] for k in _base_cols}},
 ]
 df = pd.DataFrame(rows).rename(columns={"accuracy": "Accuracy", "precision": "Precision", "recall": "Recall"})
 for col in ["Accuracy", "Precision", "Recall"]:
     df[col] = (df[col] * 100).round(1).astype(str) + " %"
-with st.container(border=True):
+with ui.card("metricas"):
     st.dataframe(df, width="stretch", hide_index=True)
 
     fig = go.Figure()
-    _colors = {"Accuracy": "#1D4ED8", "Precision": "#0B0F19", "Recall": "#9CA3AF"}
+    _p = ui.pal()
+    _colors = {"Accuracy": _p["accent"], "Precision": _p["second"], "Recall": _p["neutral"]}
     for metric, key in [("Accuracy", "accuracy"), ("Precision", "precision"), ("Recall", "recall")]:
         fig.add_trace(
             go.Bar(name=metric, x=[r["Método"] for r in rows], y=[r[key] for r in rows], marker_color=_colors[metric])
         )
-    fig.update_layout(
-        barmode="group", height=420, margin=dict(l=10, r=10, t=20, b=10),
-        yaxis_title="Aciertos (de 0 a 1)",
-        plot_bgcolor="#FFFFFF", paper_bgcolor="#FFFFFF",
+    ui.style_fig(fig, height=420, barmode="group", yaxis_title="Aciertos (de 0 a 1)")
+    ui.plotly_chart(fig)
+
+# Métricas de probabilidad (auditoría, M1): solo en modelos entrenados tras
+# la revisión. La accuracy con umbral 0,5 no dice si el modelo ordena bien
+# los casos; el AUC sí (0,5 = azar).
+if "roc_auc" in m_model:
+    c1, c2 = st.columns(2)
+    c1.metric("AUC", f"{m_model['roc_auc']:.3f}", help="0,5 = como tirar una moneda; 1 = ordena perfectamente.")
+    c2.metric("Log loss", f"{m_model['log_loss']:.4f}", help="Menor es mejor. 0,693 = decir siempre 50 %.")
+if horizon != 1 and "roc_auc" not in m_model:
+    st.caption(
+        "ℹ️ Este modelo se entrenó antes de la revisión de auditoría: su baseline de persistencia usa el "
+        "movimiento de un solo día también para este horizonte. Reentrena para ver la comparación justa."
     )
-    st.plotly_chart(fig, width="stretch")
 
 st.divider()
 
@@ -143,8 +161,9 @@ st.markdown(
 - **Predecir siempre lo más frecuente** (calculado solo con los datos más antiguos, nunca con los que se
   usan para comprobar el modelo): mira qué pasó más veces en el pasado — sube o baja — y apuesta siempre
   por eso. Si el modelo no le gana, es como si no hiciera nada.
-- **Predecir que mañana repite a hoy**: apuesta a que la tendencia de hoy sigue mañana. Parece una
-  apuesta simplona, pero en bolsa no es nada fácil de superar.
+- **Persistencia**: apuesta a que la tendencia reciente continúa — la de hoy para el horizonte día, la
+  de la última semana para el semanal y la del último mes para el mensual. Parece una apuesta simplona,
+  pero en bolsa no es nada fácil de superar.
 
 Ver `CONTEXTO.md`, sección "Contrato de evaluación", para el porqué de este diseño.
     """
@@ -195,26 +214,22 @@ else:
             fig = go.Figure()
             fig.add_trace(go.Scatter(
                 x=[0.5, 1.0], y=[0.5, 1.0], mode="lines", name="Calibración perfecta",
-                line=dict(color="#9CA3AF", dash="dot"),
+                line=dict(color=ui.pal()["muted"], dash="dot"),
             ))
             fig.add_trace(go.Scatter(
                 x=[b["confianza_media"] for b in tabla], y=[b["acierto_real"] for b in tabla],
                 mode="lines+markers", name="Modelo (real)",
-                line=dict(color="#1D4ED8", width=2), marker=dict(size=7),
+                line=dict(color=ui.pal()["accent"], width=2), marker=dict(size=7),
                 text=[f"n={b['n']}" for b in tabla], hovertemplate="confianza %{x:.0%} · acierto %{y:.0%} · %{text}<extra></extra>",
             ))
-            fig.update_layout(
-                height=320, margin=dict(l=10, r=10, t=20, b=10),
-                xaxis_title="Confianza declarada", yaxis_title="Acierto real observado",
-                xaxis=dict(range=[0.45, 1.02], tickformat=".0%"), yaxis=dict(range=[0.0, 1.02], tickformat=".0%"),
-                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
-                plot_bgcolor="#FFFFFF", paper_bgcolor="#FFFFFF",
-            )
-            with st.container(border=True):
-                st.plotly_chart(fig, width="stretch")
+            ui.style_fig(fig, height=320, xaxis_title="Confianza declarada", yaxis_title="Acierto real observado")
+            fig.update_xaxes(range=[0.45, 1.02], tickformat=".0%")
+            fig.update_yaxes(range=[0.0, 1.02], tickformat=".0%")
+            with ui.card("calibracion"):
+                ui.plotly_chart(fig)
     st.caption(
         "Cada punto agrupa un décimo de las predicciones del test por confianza declarada. Cuanto más se "
-        "acerque la línea azul a la diagonal gris, más calibrada está la probabilidad. Por debajo de la "
+        "acerque la línea de color a la diagonal punteada, más calibrada está la probabilidad. Por debajo de la "
         "diagonal: el modelo dice tener más confianza de la que realmente demuestra — es el caso a "
         "vigilar antes de presentar esta probabilidad como \"confianza\" sin más. Por encima: el modelo es "
         "más certero de lo que dice (infravalora su propia confianza, menos grave para el usuario)."

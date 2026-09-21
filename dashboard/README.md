@@ -186,7 +186,7 @@ streamlit run ...` lo evita siempre.)
 - **`views/premium.py`** (nuevo, 2026-08-31; registrada en el v1 desde el
   mismo día) — "Contenido Premium": vista previa del futuro apartado de
   pago, con los 4 hyperscalers (AMZN, MSFT, GOOGL, META) en pestañas y
-  un apartado "Próximamente" para NVDA y SPX. Lee directamente los `.md`
+  un apartado "Próximamente" para NVDA y SpaceX. Lee directamente los `.md`
   de `docs/premium/` (fuera del pipeline, no toca la base de datos salvo
   para nombre/logo de cada ticker) — si un archivo todavía no existe
   para un ticker, muestra una tarjeta de "en preparación"/"Próximamente"

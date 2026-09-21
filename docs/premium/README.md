@@ -35,10 +35,11 @@ GOOGL, con las cuatro fuentes oficiales por primera vez", y "Cuarto y
 último análisis de esta tanda: META").
 
 Además, la página del dashboard reserva un apartado "Próximamente" para
-**NVDA** y **SPX** (el índice S&P 500) — todavía sin material del
-usuario ni archivo `.md`. Cuando llegue contenido para cualquiera de los
-dos, va en `otros/<TICKER>.md` (carpeta nueva, sin plantilla propia
-todavía — SPX en particular no es una empresa individual, así que
+**NVDA** y **SpaceX** — todavía sin material del usuario ni archivo
+`.md`. Cuando llegue contenido para cualquiera de los dos, va en
+`otros/<CLAVE>.md` (`otros/NVDA.md`, `otros/SPACEX.md`; carpeta nueva,
+sin plantilla propia todavía — SpaceX en particular es una empresa
+privada que no cotiza y no publica resultados trimestrales, así que
 probablemente necesite una plantilla distinta a la de `hyperscalers/`;
 se diseña cuando haya material real que analizar).
 

@@ -48,12 +48,17 @@ HYPERSCALERS = ["AMZN", "MSFT", "GOOGL", "META"]
 
 # "Próximamente": todavía sin material del usuario ni archivo .md. NVDA sí
 # forma parte del universo de 208 tickers de Stocker (tiene metadatos y
-# logo vía data_access); SPX (el índice S&P 500) no es una acción
-# individual, así que no está en `stocks` — de ahí el nombre a mano en
-# vez de tirar de get_ticker_metadata como en los hyperscalers.
+# logo vía data_access); SpaceX es una empresa privada que no cotiza, así
+# que no tiene ticker ni está en `stocks` — de ahí el nombre a mano en vez
+# de tirar de get_ticker_metadata como en los hyperscalers (2026-09-21,
+# corrección del usuario: aquí figuraba SPX / S&P 500 por error).
+#
+# `clave` es el nombre del archivo en docs/premium/otros/<clave>.md, y
+# `etiqueta` lo que se enseña al lado del nombre: el ticker cuando cotiza,
+# "Privada · no cotiza" cuando no.
 PROXIMAMENTE = [
-    {"ticker": "NVDA", "nombre": "NVIDIA Corporation"},
-    {"ticker": "SPX", "nombre": "S&P 500"},
+    {"clave": "NVDA", "nombre": "NVIDIA Corporation", "etiqueta": "NVDA"},
+    {"clave": "SPACEX", "nombre": "SpaceX", "etiqueta": "Privada · no cotiza"},
 ]
 
 
@@ -232,9 +237,9 @@ st.subheader("Próximamente")
 cols = st.columns(len(PROXIMAMENTE))
 for item, col in zip(PROXIMAMENTE, cols):
     with col:
-        contenido = _read_analysis(str(_PREMIUM_DIR / "otros" / f"{item['ticker']}.md"))
-        with ui.card(f"premium_proximamente_{item['ticker']}"):
-            st.markdown(f"**{html.escape(item['nombre'])}** · `{item['ticker']}`")
+        contenido = _read_analysis(str(_PREMIUM_DIR / "otros" / f"{item['clave']}.md"))
+        with ui.card(f"premium_proximamente_{item['clave']}"):
+            st.markdown(f"**{html.escape(item['nombre'])}** · `{item['etiqueta']}`")
             if contenido:
                 st.markdown(contenido)
             else:

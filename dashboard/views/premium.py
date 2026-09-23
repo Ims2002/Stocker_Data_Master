@@ -54,11 +54,12 @@ HYPERSCALERS = ["AMZN", "MSFT", "GOOGL", "META"]
 # corrección del usuario: aquí figuraba SPX / S&P 500 por error).
 #
 # `clave` es el nombre del archivo en docs/premium/otros/<clave>.md, y
-# `etiqueta` lo que se enseña al lado del nombre: el ticker cuando cotiza,
-# "Privada · no cotiza" cuando no.
+# `etiqueta` lo que se enseña al lado del nombre. SPCX es la etiqueta que
+# pidió el usuario (2026-09-23) para SpaceX; no es un ticker real de
+# cotización, solo el código con el que se identifica aquí.
 PROXIMAMENTE = [
     {"clave": "NVDA", "nombre": "NVIDIA Corporation", "etiqueta": "NVDA"},
-    {"clave": "SPACEX", "nombre": "SpaceX", "etiqueta": "Privada · no cotiza"},
+    {"clave": "SPCX", "nombre": "SpaceX", "etiqueta": "SPCX"},
 ]
 
 

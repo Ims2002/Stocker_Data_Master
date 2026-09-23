@@ -21,10 +21,10 @@ sitios.
 
 Qué modo se usa: el que Streamlit tiene activo (`st.context.theme.type`),
 que por defecto sigue la preferencia del sistema del visitante y se puede
-cambiar en el menú ⋮ > Settings. Limitación conocida de Streamlit: si se
-cambia el tema desde ese menú, los gráficos y el CSS de este módulo se
-actualizan en la siguiente interacción (cualquier clic o cambio de filtro),
-no al instante.
+cambiar en el menú ⋮. Streamlit solo reenvía el tema al servidor cuando el
+script se vuelve a ejecutar, así que al cambiar de modo el CSS de aquí y los
+gráficos se quedarían con el tema anterior hasta la siguiente interacción;
+`sync_theme()` (2026-09-23) fuerza esa ejecución y el repintado es inmediato.
 
 Logo: se mantiene el actual (wordmark STOCKER con la K de tendencia). En modo
 oscuro se usa una variante con el trazo vertical y las letras en claro
@@ -42,6 +42,7 @@ from pathlib import Path
 
 import plotly.graph_objects as go
 import streamlit as st
+import streamlit.components.v1 as components
 
 _ASSETS_DIR = Path(__file__).resolve().parent / "assets"
 WORDMARK_SVG_PATH = _ASSETS_DIR / "stocker_wordmark.svg"
@@ -155,6 +156,9 @@ _CSS_COMMON = """
     font-variant-numeric: tabular-nums;
 }
 [data-testid="stHeader"] { box-shadow: none; }
+/* Sincronizador de tema (ver sync_theme): botón oculto + iframe de 0px. No
+   ocupa sitio y el script del iframe se ejecuta igual con display:none. */
+.st-key-stk_theme_sync { display: none !important; }
 /* Menos aire vacío entre la barra superior y el contenido. */
 [data-testid="stMainBlockContainer"] { padding-top: 3.6rem; }
 /* Noticias propias (HTML): enlaces sin subrayado, heredan color. */
@@ -192,7 +196,10 @@ hr {{ border-color: {line} !important; }}
 _CSS_DARK = """
 [data-testid="stHeader"] {{ background: #0A0D13; border-bottom: 1px solid {line}; }}
 /* Navegación tipo terminal: mayúsculas condensadas; la página activa en ámbar. */
-[data-testid="stTopNavLink"] {{ border-radius: 0 !important; padding: 0.3rem 0.65rem !important; }}
+/* Pastilla redondeada como en el modo claro (2026-09-23, segunda petición
+   del usuario: los 6px del 17/09 seguían leyéndose como un rectángulo). El
+   resto de la estética terminal sigue siendo recta. */
+[data-testid="stTopNavLink"] {{ border-radius: 999px !important; padding: 0.3rem 0.8rem !important; }}
 [data-testid="stTopNavLink"] p {{
     font-family: 'IBM Plex Sans Condensed', sans-serif !important; text-transform: uppercase;
     letter-spacing: 0.08em; font-size: 0.74rem !important; font-weight: 500 !important; color: {muted} !important;
@@ -236,6 +243,77 @@ def inject_css() -> None:
         f'div[class*="st-key-premium_chat_box"] {{ border-color: {p["accent"]} !important; }}'
     )
     st.markdown(f"<style>{_CSS_COMMON}{extra}{chat}</style>", unsafe_allow_html=True)
+
+
+# --- Sincronización del tema ------------------------------------------------
+# Streamlit reenvía el tema al servidor solo cuando el script se vuelve a
+# ejecutar, así que al cambiar de claro a oscuro desde el menú ⋮ los widgets
+# nativos cambian al instante pero el CSS de este módulo y los gráficos de
+# Plotly se quedan con el tema anterior hasta la siguiente interacción
+# (ver streamlit#11920). Esto lo arregla: un iframe de 0 píxeles compara el
+# tema activo en el navegador con el que se usó al pintar y, si no coinciden,
+# pulsa un botón oculto para forzar una nueva ejecución del script.
+#
+# El intento se marca en sessionStorage con el nombre del tema, de modo que
+# como mucho se fuerza UNA ejecución por cambio de tema: si por lo que sea
+# `st.context.theme.type` siguiera desactualizado, la página se queda como
+# estaba en vez de entrar en un bucle de recargas.
+
+_THEME_SYNC_KEY = "stk_theme_sync"
+
+_THEME_SYNC_JS = """
+<script>
+(function () {
+  var P = window.parent, RENDERED = "%MODE%", MARK = "stkThemeSync";
+  function stored() {
+    try {
+      var keys = Object.keys(P.localStorage);
+      for (var i = 0; i < keys.length; i++) {
+        if (keys[i].indexOf("stActiveTheme") === 0) {
+          var v = JSON.parse(P.localStorage.getItem(keys[i]));
+          var name = (typeof v === "string") ? v : (v && v.name);
+          if (name === "Dark") return "dark";
+          if (name === "Light") return "light";
+          return null;  /* "System": manda la preferencia del navegador */
+        }
+      }
+    } catch (e) {}
+    return null;
+  }
+  function active() {
+    var s = stored();
+    if (s) { return s; }
+    try { return P.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light"; }
+    catch (e) { return "light"; }
+  }
+  function check() {
+    var now = active();
+    if (now === RENDERED) { return; }
+    try { if (P.sessionStorage.getItem(MARK) === now) { return; } } catch (e) {}
+    var btn = P.document.querySelector(".st-key-%KEY% button");
+    if (!btn) { return; }
+    try { P.sessionStorage.setItem(MARK, now); } catch (e) {}
+    btn.click();
+  }
+  check();
+  setInterval(check, 300);
+})();
+</script>
+"""
+
+
+def sync_theme() -> None:
+    """Fuerza una ejecución del script cuando el visitante cambia de tema.
+
+    Se llama una vez por página, justo después de `inject_css()`. El botón y
+    el iframe van dentro de un contenedor que el CSS oculta."""
+    with st.container(key=_THEME_SYNC_KEY):
+        st.button("Sincronizar tema", key=f"{_THEME_SYNC_KEY}_btn")
+        components.html(
+            _THEME_SYNC_JS.replace("%MODE%", mode()).replace("%KEY%", _THEME_SYNC_KEY),
+            height=0,
+            width=0,
+        )
 
 
 # --- Gráficos (Plotly) ------------------------------------------------------

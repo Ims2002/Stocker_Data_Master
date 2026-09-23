@@ -81,6 +81,7 @@ import ui  # noqa: E402
 st.set_page_config(page_title="Stocker", page_icon=str(ui.APP_ICON_DARK_SVG_PATH), layout="wide")
 
 ui.inject_css()
+ui.sync_theme()  # repinta al cambiar de tema sin esperar a la siguiente interacción
 ui.render_logo()
 
 pages = [

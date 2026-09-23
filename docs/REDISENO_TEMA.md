@@ -13,9 +13,14 @@ Streamlit sigue la preferencia de claro u oscuro del sistema de cada visitante.
 Cada persona puede cambiarlo en el menú **⋮ > Settings > Theme** (por eso
 `client.toolbarMode` pasa de `minimal` a `viewer`).
 
-Limitación de Streamlit: al cambiar de tema desde ese menú, los widgets cambian
-al instante, pero los gráficos y los acabados propios lo hacen en la siguiente
-interacción (cualquier clic o cambio de filtro).
+Streamlit solo reenvía el tema al servidor cuando el script se vuelve a
+ejecutar, así que por sí solo cambiaría los widgets al instante y dejaría los
+gráficos y los acabados propios con el tema anterior hasta la siguiente
+interacción (ver streamlit#11920). `ui.sync_theme()` (23/09/2026) lo resuelve:
+un iframe de 0 píxeles compara el tema activo en el navegador con el que se
+usó al pintar y, si no coinciden, pulsa un botón oculto que provoca una nueva
+ejecución. Se marca el intento en `sessionStorage`, así que como mucho se
+fuerza una ejecución por cambio de tema — nunca un bucle.
 
 ## Dónde está cada cosa
 
@@ -25,6 +30,8 @@ interacción (cualquier clic o cambio de filtro).
   - `PALETTES`: los mismos colores, para lo que Streamlit no pinta solo.
   - `inject_css()`: acabado de navegación, tarjetas y métricas de cada modo.
   - `card(key)`: tarjeta del tema. Úsala en lugar de `st.container(border=True)`.
+  - `sync_theme()`: repintado inmediato al cambiar de tema (ver arriba). Se
+    llama una vez en `dashboard/Inicio.py`, justo después de `inject_css()`.
   - `style_fig()` y `plotly_chart()`: estilo común de los gráficos de Plotly.
   - `price_chart()`: gráfico principal (área en claro, velas en oscuro).
   - `render_ticker_tape()`: cinta de cotizaciones del modo terminal.

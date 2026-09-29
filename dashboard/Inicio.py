@@ -98,5 +98,5 @@ pg = st.navigation(pages, position="top")
 # Aviso legal antes del contenido (auditoría, U1): muchas páginas terminan
 # con st.stop(), así que un aviso colocado después de pg.run() no llegaría a
 # pintarse en esos casos.
-ui.render_disclaimer()
+#ui.render_disclaimer()
 pg.run()

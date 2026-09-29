@@ -48,8 +48,7 @@ df = _resolved()
 if df.empty:
     st.info(
         "Todavía no hay ninguna predicción resuelta — hace falta que pase al menos un día de mercado "
-        "desde que se predijo, y que `track_predictions.py` se haya ejecutado (ver "
-        "`run_daily_pipeline.bat`). Vuelve en unos días.",
+        "desde que se hizo. Vuelve en unos días.",
         icon="🕒",
     )
     st.stop()
@@ -96,15 +95,13 @@ st.caption(
     "⚠️ Cada \"sesión de mercado\" son ~208 predicciones (una por ticker), pero no son 208 datos "
     "independientes — son 208 acciones reaccionando al mismo día de mercado. La columna que de verdad "
     "mide el tamaño de la muestra es \"Sesiones de mercado\", no \"Predicciones resueltas\". Con pocas "
-    "sesiones, el acierto real puede moverse mucho de una versión a otra sin que signifique nada todavía "
-    "— ver CONTEXTO.md, \"Seguimiento real de predicciones\"."
+    "sesiones, el acierto real puede moverse mucho de una versión a otra sin que signifique nada todavía."
 )
 
 st.caption(
     "«Referencia: siempre sube» es el acierto que habría tenido decir «sube» en todas las mismas "
-    "predicciones (auditoría, M1): si el modelo no la supera, no aporta nada sobre una regla trivial. Desde la revisión, las "
-    "predicciones solo se resuelven con cierres definitivos; las anteriores se recalcularon con "
-    "`track_predictions.py --reresolve`."
+    "predicciones: si el modelo no la supera, no aporta nada sobre una regla trivial. Una predicción solo "
+    "se da por resuelta con el cierre definitivo de la sesión."
 )
 
 st.divider()

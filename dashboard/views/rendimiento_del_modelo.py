@@ -57,8 +57,8 @@ def _model_bundle(horizon: int, model_version: str):
 _version = da.latest_model_version(horizon)
 if _version is None:
     st.info(
-        f"Todavía no hay ningún modelo entrenado para el horizonte **{horizonte_label}** — ejecuta "
-        f"`python src/model.py --horizon {horizon}`. Elige **Día (mañana)** mientras tanto.",
+        f"Todavía no hay resultados disponibles para el horizonte **{horizonte_label}**. "
+        "Elige **Día (mañana)** mientras tanto.",
         icon="🚧",
     )
     st.stop()
@@ -66,8 +66,8 @@ bundle = _model_bundle(horizon, _version)
 
 if "metrics_model" not in bundle:
     st.warning(
-        "El modelo cargado se guardó antes de que empezáramos a guardar estos resultados junto con él. "
-        "Ejecuta de nuevo `python src/model.py` para poder ver esta página con datos reales.",
+        "Este modelo se guardó sin los resultados de su examen, así que esta página no puede mostrarlos "
+        "todavía. Elige otro horizonte mientras tanto.",
         icon="⚠️",
     )
     st.stop()
@@ -94,7 +94,7 @@ else:
         "El modelo NO le gana de forma clara a esas dos formas simples de adivinar. Esto es un resultado "
         "honesto que se muestra tal cual, no se esconde — a corto plazo el precio de las acciones se "
         "comporta casi como si fuera aleatorio, así que es un resultado esperable, no un fallo del "
-        "proyecto (más detalle en CONTEXTO.md).",
+        "propio modelo.",
         icon="⚠️",
     )
 
@@ -149,8 +149,8 @@ if "roc_auc" in m_model:
     c2.metric("Log loss", f"{m_model['log_loss']:.4f}", help="Menor es mejor. 0,693 = decir siempre 50 %.")
 if horizon != 1 and "roc_auc" not in m_model:
     st.caption(
-        "ℹ️ Este modelo se entrenó antes de la revisión de auditoría: su baseline de persistencia usa el "
-        "movimiento de un solo día también para este horizonte. Reentrena para ver la comparación justa."
+        "ℹ️ Para este horizonte, la comparación con la persistencia usa el movimiento de un solo día, "
+        "así que es algo más exigente con el modelo de lo que le correspondería."
     )
 
 st.divider()
@@ -165,7 +165,6 @@ st.markdown(
   de la última semana para el semanal y la del último mes para el mensual. Parece una apuesta simplona,
   pero en bolsa no es nada fácil de superar.
 
-Ver `CONTEXTO.md`, sección "Contrato de evaluación", para el porqué de este diseño.
     """
 )
 
@@ -178,8 +177,7 @@ El modelo no solo dice "sube" o "baja": en "Predicciones" y "Dashboard" también
 para esa dirección. Para que esa probabilidad se pueda leer como una confianza real, tiene que estar
 **calibrada**: si el modelo dice "70% de confianza" en un grupo de predicciones, ese grupo debería acertar
 aproximadamente el 70% de las veces — ni más ni menos. Random Forest no lo garantiza por diseño, así que
-se comprueba con datos reales del test oficial en vez de asumirlo (feedback recibido de un tutor del TFM,
-ver CONTEXTO.md "Calibración de predicted_probability").
+se comprueba con los datos reales del examen en vez de darlo por supuesto.
     """
 )
 

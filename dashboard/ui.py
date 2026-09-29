@@ -515,9 +515,9 @@ DISCLAIMER = (
 )
 
 
-def render_disclaimer() -> None:
-    """Aviso legal en todas las páginas (auditoría, U1)."""
-    st.caption(f"⚖️ {DISCLAIMER}")
+# def render_disclaimer() -> None:
+#     """Aviso legal en todas las páginas (auditoría, U1)."""
+#     st.caption(f"⚖️ {DISCLAIMER}")
 
 
 def render_data_freshness(latest_date, pipeline_status: dict | None = None) -> None:
@@ -530,9 +530,9 @@ def render_data_freshness(latest_date, pipeline_status: dict | None = None) -> N
         fin = str(pipeline_status["finished_at"]).replace("T", " ")[:16]
         errores = [s["step"] for s in pipeline_status.get("steps", []) if s.get("rc")]
         if pipeline_status.get("result") == "database_corrupt":
-            texto += " ⚠️ La última actualización se detuvo: la base de datos necesita reparación."
+            texto += " ⚠️ La última actualización no pudo completarse; los datos pueden no ser los más recientes."
         elif errores:
-            texto += f" Última actualización {fin}, con avisos en: {', '.join(errores)}."
+            texto += f" Última actualización {fin}, con incidencias en la recogida de datos."
         else:
             texto += f" Última actualización {fin}, sin errores."
     st.caption(texto)

@@ -52,7 +52,7 @@ def _model_bundle(horizon: int, model_version: str):
 
 tickers = _tickers()
 if not tickers:
-    st.error("No hay tickers con datos en daily_prices. Ejecuta antes download.py → load.py.")
+    st.error("Todavía no hay datos de mercado disponibles. Vuelve a intentarlo en unos minutos.")
     st.stop()
 
 meta_tickers = _tickers_by_sector()
@@ -96,10 +96,8 @@ with col_meta:
 _version = da.latest_model_version(horizon)
 if _version is None:
     st.info(
-        f"Todavía no hay ningún modelo entrenado para el horizonte **{horizonte_label}** — ejecuta "
-        f"`python src/model.py --horizon {horizon}` (y `python src/predict.py --horizon {horizon}` para "
-        "generar predicciones reales con él). Selecciona **Día (mañana)** para ver la predicción real de "
-        "hoy mientras tanto.",
+        f"Todavía no hay predicciones disponibles para el horizonte **{horizonte_label}**. "
+        "Selecciona **Día (mañana)** para ver la predicción de hoy mientras tanto.",
         icon="🚧",
     )
     st.stop()
@@ -174,7 +172,7 @@ latest_pred = da.get_latest_prediction(engine, ticker, horizon=horizon)
 if latest_pred and latest_pred["model_version"] != bundle.get("_model_version"):
     st.caption(
         f"ℹ️ La predicción guardada se hizo con `{latest_pred['model_version']}`; el gráfico de aciertos usa "
-        f"`{bundle.get('_model_version')}`, más reciente. Se igualarán en la próxima ejecución del pipeline."
+        f"`{bundle.get('_model_version')}`, más reciente. Se igualarán en la próxima actualización diaria."
     )
 
 fig = ui.price_chart(
@@ -246,7 +244,6 @@ st.divider()
 # predicciones poco concluyentes, trazabilidad y consistencia del
 # sentimiento").
 st.caption(
-    "Todas las cifras de esta página salen de `stocker.db`, generado por el pipeline real "
-    "(`download.py → load.py → gold.py → model.py → predict.py`, ver `docs/entregas/` para el detalle "
-    "metodológico) — el dashboard nunca escribe ni inventa datos."
+    "Todas las cifras de esta página salen del histórico de mercado que Stocker actualiza cada día "
+    "tras el cierre de EE. UU. — ningún dato se edita ni se estima a mano."
 )

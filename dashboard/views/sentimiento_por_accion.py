@@ -37,8 +37,7 @@ import ui  # noqa: E402
 st.title("Noticias y sentimiento de una acción")
 st.caption(
     "Qué se ha publicado sobre esta acción y con qué tono — informativo, para hacerte una idea del ruido "
-    "mediático alrededor de una acción. No es una señal que el modelo use para predecir con fiabilidad "
-    "(ver ¿Ayuda el sentimiento a acertar más? en CONTEXTO.md)."
+    "mediático alrededor de una acción. No es una señal que el modelo use para predecir."
 )
 
 engine = da.get_engine()
@@ -61,7 +60,7 @@ def _coverage():
 
 tickers = _tickers()
 if not tickers:
-    st.error("No hay tickers con datos en daily_prices. Ejecuta antes download.py → load.py.")
+    st.error("Todavía no hay datos de mercado disponibles. Vuelve a intentarlo en unos minutos.")
     st.stop()
 
 coverage = _coverage()
@@ -96,8 +95,8 @@ daily = da.get_daily_sentiment_for_ticker(engine, ticker, months=6)
 
 if daily.empty:
     st.info(
-        f"Todavía no hay noticias guardadas de {ticker} — el backfill de noticias sigue en marcha "
-        f"({coverage['tickers_cubiertos']}/{coverage['tickers_totales']} tickers cubiertos por ahora). "
+        f"Todavía no hay noticias guardadas de {ticker} — la recopilación de noticias aún no cubre todas "
+        f"las acciones ({coverage['tickers_cubiertos']} de {coverage['tickers_totales']} por ahora). "
         "Vuelve en unos días.",
         icon="🕒",
     )
@@ -140,7 +139,7 @@ st.divider()
 # --- Titulares recientes ---
 st.subheader("Titulares recientes")
 st.caption(
-    "Alpha Vantage etiqueta un artículo con esta acción en cuanto la MENCIONA, aunque sea de pasada — "
+    "El proveedor de noticias etiqueta un artículo con esta acción en cuanto la MENCIONA, aunque sea de pasada — "
     "muchos titulares no son en realidad sobre esta empresa (ej. \"F5 lanza una suite con NVIDIA\" aparece "
     "bajo NVDA con relevancia baja). Por eso se filtra por relevancia mínima: solo se muestran artículos "
     "que hablan de verdad de esta acción."

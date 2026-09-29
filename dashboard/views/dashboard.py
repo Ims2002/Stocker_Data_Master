@@ -210,7 +210,7 @@ def _daily_sentiment(ticker: str):
 
 tickers = _tickers()
 if not tickers:
-    st.error("No hay tickers con datos en daily_prices. Ejecuta antes download.py → load.py.")
+    st.error("Todavía no hay datos de mercado disponibles. Vuelve a intentarlo en unos minutos.")
     st.stop()
 
 meta_tickers = _tickers_by_sector()
@@ -269,8 +269,7 @@ bundle = _model_bundle(horizon, _version) if _version else None
 
 if bundle is None:
     st.info(
-        f"Todavía no hay ningún modelo entrenado para el horizonte **{horizonte_label}** — ejecuta "
-        f"`python src/model.py --horizon {horizon}` (y `python src/predict.py --horizon {horizon}`). "
+        f"Todavía no hay predicciones disponibles para el horizonte **{horizonte_label}**. "
         "Elige **Día (mañana)** mientras tanto.",
         icon="🚧",
     )
@@ -529,8 +528,8 @@ with col_read:
 
         st.markdown(" ".join(partes))
         st.caption(
-            "Texto generado a partir de los mismos datos de arriba — el sentimiento de noticias es "
-            "informativo, sin evidencia de que ayude a predecir el precio (ver CONTEXTO.md)."
+            "Texto generado a partir de los mismos datos de arriba — el sentimiento de las noticias es "
+            "informativo: no hay evidencia de que ayude a predecir el precio."
         )
 
 st.divider()
@@ -543,7 +542,6 @@ st.divider()
 # visible en la propia página en vez de asumir que quien la mira ya
 # conoce el repositorio.
 st.caption(
-    "Todas las cifras de esta página salen de `stocker.db`, generado por el pipeline real "
-    "(`download.py → load.py → gold.py → model.py → predict.py`, ver `docs/entregas/` para el detalle "
-    "metodológico) — el dashboard nunca escribe ni inventa datos."
+    "Todas las cifras de esta página salen del histórico de mercado que Stocker actualiza cada día "
+    "tras el cierre de EE. UU. — ningún dato se edita ni se estima a mano."
 )

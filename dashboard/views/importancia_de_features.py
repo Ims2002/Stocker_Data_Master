@@ -42,7 +42,7 @@ def _model_bundle(horizon: int, model_version: str):
 
 _version = da.latest_model_version(horizon)
 if _version is None:
-    st.info(f"No hay ningún modelo entrenado para este horizonte. Ejecuta `python src/model.py --horizon {horizon}`.")
+    st.info("Todavía no hay análisis disponible para este horizonte. Elige **Día (mañana)** mientras tanto.")
     st.stop()
 bundle = _model_bundle(horizon, _version)
 
@@ -89,9 +89,9 @@ if metodo == "permutacion":
     )
 else:
     st.caption(
-        "ℹ️ Este modelo se entrenó antes de la revisión de auditoría: el peso es la importancia interna del "
-        "Random Forest, que tiende a favorecer datos con muchos valores distintos y se mide sobre el "
-        "entrenamiento. Reentrena para ver la importancia medida sobre el examen real."
+        "ℹ️ Aquí el peso es la importancia interna del modelo, medida sobre los datos con los que "
+        "aprendió: tiende a favorecer variables con muchos valores distintos, así que se lee como una "
+        "orientación, no como una medida exacta."
     )
 
 st.divider()
@@ -121,6 +121,6 @@ Modelo usado: **{"Random Forest" if model_type == "random_forest" else "Regresi�
 
 Ninguna de las {n_features} variables usa el precio de la acción en bruto (20 dólares o 900 dólares) —
 todas están calculadas como porcentajes o comparaciones relativas, para que una acción cara y una barata
-sean comparables entre sí. Ver `CONTEXTO.md` y `model.build_feature_matrix` para el detalle completo.
+sean comparables entre sí.
         """
     )

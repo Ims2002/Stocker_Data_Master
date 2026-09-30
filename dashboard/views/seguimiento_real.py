@@ -59,7 +59,8 @@ st.divider()
 st.subheader("Por versión de modelo")
 st.caption(
     "Cada fila es una versión de modelo distinta, entrenada en un momento distinto — nunca se mezclan "
-    "entre sí en el mismo cálculo de acierto (ver aviso más abajo sobre por qué)."
+    "entre sí en el mismo cálculo de acierto (ver aviso más abajo sobre por qué). Arriba, las que están "
+    "haciendo las predicciones de hoy y ya tienen muestra suficiente; el resto, en el desplegable."
 )
 
 resumen = (
@@ -75,21 +76,64 @@ resumen = (
     .sort_values("ultima_fecha")
     .reset_index()
 )
-resumen_view = resumen.rename(columns={
-    "model_version": "Modelo",
-    "primera_fecha": "Desde",
-    "ultima_fecha": "Hasta",
-    "dias_de_mercado": "Sesiones de mercado",
-    "n_predicciones": "Predicciones resueltas",
-    "acierto": "Acierto real",
-    "acierto_siempre_sube": "Referencia: siempre sube",
-})
-resumen_view["Desde"] = resumen_view["Desde"].dt.date.astype(str)
-resumen_view["Hasta"] = resumen_view["Hasta"].dt.date.astype(str)
-for _col in ("Acierto real", "Referencia: siempre sube"):
-    resumen_view[_col] = (resumen_view[_col] * 100).round(1).astype(str) + " %"
+
+# Qué se enseña arriba y qué se guarda en el desplegable (2026-09-30,
+# petición del usuario). Dos condiciones, y hay que cumplir las dos:
+#
+#   - Estar en uso: ser el modelo más reciente de su horizonte, que es el
+#     que está haciendo las predicciones de hoy. Las versiones sustituidas
+#     siguen publicadas — no se esconde ningún resultado — pero debajo.
+#   - Tener muestra suficiente: MIN_RESUELTAS predicciones ya resueltas.
+#     Con menos, el acierto solo refleja el azar de dos o tres sesiones
+#     (caso real: una versión con UNA predicción resuelta mostraba 0,0 %).
+MIN_RESUELTAS = 30
+_HORIZONTES = (1, 5, 20)
+
+en_produccion = {v for v in (da.latest_model_version(h) for h in _HORIZONTES) if v}
+es_actual = resumen["model_version"].isin(en_produccion)
+hay_muestra = resumen["n_predicciones"] >= MIN_RESUELTAS
+
+
+def _formatear(tabla: pd.DataFrame) -> pd.DataFrame:
+    vista = tabla.rename(columns={
+        "model_version": "Modelo",
+        "primera_fecha": "Desde",
+        "ultima_fecha": "Hasta",
+        "dias_de_mercado": "Sesiones de mercado",
+        "n_predicciones": "Predicciones resueltas",
+        "acierto": "Acierto real",
+        "acierto_siempre_sube": "Referencia: siempre sube",
+    }).copy()
+    vista["Desde"] = vista["Desde"].dt.date.astype(str)
+    vista["Hasta"] = vista["Hasta"].dt.date.astype(str)
+    for col in ("Acierto real", "Referencia: siempre sube"):
+        vista[col] = (vista[col] * 100).round(1).astype(str) + " %"
+    return vista
+
+
+activas = resumen[es_actual & hay_muestra]
+resto = resumen[~(es_actual & hay_muestra)].sort_values("ultima_fecha", ascending=False)
+
 with ui.card("resumen_versiones"):
-    st.dataframe(resumen_view, width="stretch", hide_index=True)
+    if activas.empty:
+        st.info(
+            f"Ninguna de las versiones en uso llega todavía a {MIN_RESUELTAS} predicciones resueltas. "
+            "Las tienes abajo, en el desplegable, con el aviso de que su acierto aún no es "
+            "representativo.",
+            icon="🕒",
+        )
+    else:
+        st.dataframe(_formatear(activas), width="stretch", hide_index=True)
+
+if not resto.empty:
+    with st.expander(f"Versiones anteriores y con menos de {MIN_RESUELTAS} predicciones resueltas ({len(resto)})"):
+        st.caption(
+            "Aquí están las versiones que ya no hacen predicciones — cada reentrenamiento crea una nueva "
+            f"y la anterior deja de usarse — y las que todavía no llegan a {MIN_RESUELTAS} predicciones "
+            "resueltas. No se ocultan: su resultado es el que fue, bueno o malo. Pero con dos o tres "
+            "sesiones el acierto se mueve por azar, así que no sirve para comparar."
+        )
+        st.dataframe(_formatear(resto), width="stretch", hide_index=True)
 
 st.caption(
     "⚠️ Cada \"sesión de mercado\" son ~208 predicciones (una por ticker), pero no son 208 datos "
